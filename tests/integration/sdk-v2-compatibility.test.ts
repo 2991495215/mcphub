@@ -228,3 +228,67 @@ describe('opt-in modern upstream negotiation', () => {
     }
   });
 });
+
+describe('legacy Apps upstream without resources capability', () => {
+  it('reads declared widgets while retaining other capability checks', async () => {
+    const client = new LegacyMcpClient({ name: 'hub', version: '1' });
+    const [upstream, downstream] = InMemoryTransport.createLinkedPair();
+    const methods: string[] = [];
+    downstream.onmessage = async (message) => {
+      if (!('method' in message) || !('id' in message)) return;
+      methods.push(message.method);
+      const result =
+        message.method === 'initialize'
+          ? {
+              protocolVersion: '2025-03-26',
+              serverInfo: { name: 'legacy-app', version: '1' },
+              capabilities: { tools: {} },
+            }
+          : message.method === 'tools/list'
+            ? {
+                tools: [
+                  {
+                    name: 'design',
+                    inputSchema: { type: 'object' },
+                    _meta: { ui: { resourceUri: 'ui://app/design' } },
+                  },
+                ],
+              }
+            : {
+                contents: [
+                  {
+                    uri: 'ui://app/design',
+                    mimeType: 'text/html;profile=mcp-app',
+                    text: '<html></html>',
+                  },
+                ],
+              };
+      await downstream.send({ jsonrpc: '2.0', id: message.id!, result });
+    };
+    try {
+      await downstream.start();
+      await client.connect(upstream);
+      await expect(client.readResource({ uri: 'ui://app/design' })).rejects.toThrow(
+        'Server does not support resources',
+      );
+      await client.listTools();
+      await expect(client.readResource({ uri: 'ui://app/design' })).resolves.toMatchObject({
+        contents: [{ mimeType: 'text/html;profile=mcp-app' }],
+      });
+      await expect(client.readResource({ uri: 'ui://app/unadvertised' })).rejects.toThrow(
+        'Server does not support resources',
+      );
+      await expect(client.readResource({ uri: 'file:///secret' })).rejects.toThrow(
+        'Server does not support resources',
+      );
+      await expect(client.listResources()).rejects.toThrow('Server does not support resources');
+      await expect(client.subscribeResource({ uri: 'ui://app/design' })).rejects.toThrow(
+        'Server does not support resources',
+      );
+      expect(methods).toEqual(['initialize', 'tools/list', 'resources/read']);
+    } finally {
+      await client.close();
+      await downstream.close();
+    }
+  });
+});

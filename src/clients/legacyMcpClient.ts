@@ -46,6 +46,37 @@ export class LegacyMcpClient extends Client {
     return result;
   }
 
+  private isDeclaredAppResource(uri?: string): boolean {
+    return [...this.listedTools.values()].some((tool) => {
+      const meta = tool._meta;
+      const ui = meta?.ui;
+      const declared =
+        (ui && typeof ui === 'object' && 'resourceUri' in ui ? ui.resourceUri : undefined) ??
+        meta?.['ui/resourceUri'] ??
+        meta?.['openai/outputTemplate'];
+      return (
+        typeof declared === 'string' &&
+        declared.startsWith('ui://') &&
+        (uri === undefined || declared === uri)
+      );
+    });
+  }
+
+  protected override assertCapabilityForMethod(
+    method: Parameters<Client['request']>[0]['method'],
+  ): void {
+    // Some legacy Apps servers advertise widget reads in tools but omit resources.
+    if (method === 'resources/read' && this.isDeclaredAppResource()) return;
+    super.assertCapabilityForMethod(method);
+  }
+
+  override async readResource(...[params, options]: Parameters<Client['readResource']>) {
+    if (!this.getServerCapabilities()?.resources && !this.isDeclaredAppResource(params.uri)) {
+      super.assertCapabilityForMethod('resources/read');
+    }
+    return super.readResource(params, options);
+  }
+
   override async close(): Promise<void> {
     clearUpstreamLists(this);
     for (const snapshot of this.listSnapshots.values()) invalidateListFreshness(snapshot);
