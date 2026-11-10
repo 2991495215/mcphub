@@ -395,12 +395,14 @@ describe('buildServerPayload', () => {
       response_types_supported: ['code'],
     };
     const payload = buildServerPayload({
-      formData: buildSseForm({ authorizationServerMetadata }),
+      formData: buildSseForm({ authorizationServerMetadata,
+        authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] } }),
       serverType: 'sse',
       envVars: [],
       headerVars: [],
     });
     expect(payload.config.oauth?.authorizationServerMetadata).toEqual(authorizationServerMetadata);
+    expect(payload.config.oauth?.authorizationRelay).toEqual({ allowedRedirectOrigins: ['https://login.example.com'] });
   });
 
   it('preserves revocationEndpoint, redirectUri and dynamicRegistration together (deep equal)', () => {
@@ -529,4 +531,37 @@ describe('upstream protocol config in dashboard payloads', () => {
       ).toBeUndefined();
     },
   );
+});
+
+
+it('preserves normalized user-group sharing in server saves', () => {
+  const payload = buildServerPayload({
+    formData: {
+      name: 'shared',
+      url: '',
+      command: 'node',
+      arguments: '',
+      env: [],
+      headers: [],
+      visibility: 'group',
+      sharedWithUserGroups: [' readers ', 'readers'],
+    } as ServerFormData,
+    serverType: 'stdio',
+    envVars: [],
+    headerVars: [],
+  });
+  expect(payload.config).toMatchObject({ sharedWithUserGroups: ['readers'] });
+});
+
+test('preserves shared OAuth expiry when saving the form', () => {
+  const payload = buildServerPayload({
+    formData: {
+      name: 'remote', url: 'https://example.com/mcp', command: '', arguments: '',
+      env: [], headers: [], oauth: { accessToken: 'opaque', accessTokenExpiresAt: 12345 },
+    },
+    serverType: 'streamable-http',
+    envVars: [],
+    headerVars: [],
+  });
+  expect(payload.config.oauth?.accessTokenExpiresAt).toBe(12345);
 });

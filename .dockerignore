@@ -1,5 +1,6 @@
 .git
-.github
+.github/*
+!.github/release-notes-template.md
 
 node_modules
 frontend/node_modules

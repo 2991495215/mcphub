@@ -1,4 +1,7 @@
 import { getToolPolicy } from './toolPolicyService.js';
+import { isDeepStrictEqual } from 'node:util';
+import { isReplicaMode } from '../utils/replicaMode.js';
+import { withReplicaLock } from './replicaLock.js';
 import type { ToolPolicyAudit } from '../types/index.js';
 import { projectGroupToolName, assertValidGroupToolNames } from '../utils/groupToolNames.js';
 import { isSafePassthroughHeader } from '../utils/passthroughHeaders.js';
@@ -92,12 +95,14 @@ import {
   ProxychainsConfig,
   IGroup,
   IGroupServerConfig,
+  IUser,
 } from '../types/index.js';
 import { expandEnvVars, replaceEnvVars, getNameSeparator } from '../config/index.js';
 import config from '../config/index.js';
 import { validateMaxBufferSize } from '../utils/stdioOptions.js';
 import { validateServerName } from '../utils/serverNameValidation.js';
 import { getGroup } from './sseService.js';
+import { mcpEventBus } from './mcpEventBus.js';
 import { getServerConfigInGroup, normalizeGroupServers } from './groupService.js';
 import {
   removeServerToolEmbeddings,
@@ -114,6 +119,7 @@ import {
   getSystemConfigDao,
   getBuiltinPromptDao,
   getBuiltinResourceDao,
+  getCredentialBindingDao,
   ServerConfigWithName,
 } from '../dao/index.js';
 import { initializeAllOAuthClients } from './oauthService.js';
@@ -646,6 +652,7 @@ const broadcastListChanged = (
   listType: 'tool' | 'resource' | 'prompt',
   sendNotification: (server: Server) => Promise<void>,
 ): void => {
+  mcpEventBus.publish({ kind: `${listType}s_list_changed` });
   Object.values(servers).forEach((server) => {
     sendNotification(server)
       .then(() => {
@@ -673,6 +680,7 @@ export const updateServerInfoVisibility = (
   serverName: string,
   visibility: ServerConfig['visibility'],
   sharedWithUsers?: string[],
+  sharedWithUserGroups?: string[],
 ): void => {
   const serverInfo = getServerByName(serverName);
   if (!serverInfo) {
@@ -681,12 +689,14 @@ export const updateServerInfoVisibility = (
 
   serverInfo.visibility = visibility;
   serverInfo.sharedWithUsers = sharedWithUsers;
+  serverInfo.sharedWithUserGroups = sharedWithUserGroups;
 
   if (serverInfo.config) {
     serverInfo.config = {
       ...serverInfo.config,
       visibility,
       sharedWithUsers,
+      sharedWithUserGroups,
     };
   }
 };
@@ -1026,7 +1036,16 @@ const principalServerScope = new AsyncLocalStorage<ServerInfo[]>();
 const requestDiscoveryInfos = new WeakSet<ServerInfo>();
 
 const getVisibleServerInfos = (): ServerInfo[] => {
-  return getDataService().filterData(principalServerScope.getStore() ?? serverInfos);
+  const visible = getDataService().filterData(principalServerScope.getStore() ?? serverInfos);
+  // A system key with accessType 'exclude' hides its excluded servers (and the
+  // members of excluded groups, already expanded by the auth layer) from every
+  // listing, call resolution and smart-routing surface that reads this list.
+  const excludedServers = RequestContextService.getInstance().getBearerKeyExclusions();
+  if (!excludedServers || excludedServers.length === 0) {
+    return visible;
+  }
+  const excluded = new Set(excludedServers);
+  return visible.filter((serverInfo) => !excluded.has(serverInfo.name));
 };
 
 const getVisibleServerByName = (name: string): ServerInfo | undefined => {
@@ -1321,7 +1340,7 @@ const createUpstreamMcpClient = (
     },
   );
   if (elicitation && downstream) installElicitationRelay(client, downstream);
-  return client;
+  return protectReplicaOAuthClient(client, name, serverConfig);
 };
 
 export interface ServerConnectionStats {
@@ -1754,7 +1773,7 @@ export const createTransportFromConfig = async (name: string, conf: ServerConfig
   const allowInternal = !!ownerUser?.isAdmin && !hasUrlCredentialSlots(conf);
 
   if (conf.url) {
-    await assertSafeUrl(conf.url, { allowInternal });
+    await assertSafeUrl(conf.url, { allowInternal, serverId: conf.id });
   }
 
   if (conf.type === 'streamable-http') {
@@ -1768,6 +1787,9 @@ export const createTransportFromConfig = async (name: string, conf: ServerConfig
     const requestAwareFetch = createRedirectValidatingFetch(
       createRequestContextAwareFetch(baseFetch, conf.passthroughHeaders),
       allowInternal,
+      undefined,
+      undefined,
+      conf.id,
     );
 
     // Create OAuth provider if configured - SDK will handle authentication automatically
@@ -1808,6 +1830,9 @@ export const createTransportFromConfig = async (name: string, conf: ServerConfig
     const requestAwareFetch = createRedirectValidatingFetch(
       createRequestContextAwareFetch(baseFetch, conf.passthroughHeaders),
       allowInternal,
+      undefined,
+      undefined,
+      conf.id,
     );
 
     // Create OAuth provider if configured - SDK will handle authentication automatically
@@ -1971,6 +1996,8 @@ const callToolWithReconnect = async (
   isolated?: IsolatedClientContext,
   extra?: Pick<ServerContext, 'mcpReq'>,
 ): Promise<any> => {
+  // A lost response does not prove a side effect failed; replica failover never replays it.
+  if (isReplicaMode()) maxRetries = 0;
   // Local, reassignable refs so a reconnect can swap in the new connection for
   // the next retry attempt. For isolated calls these track the per-session
   // client/transport; otherwise they mirror the shared serverInfo connection.
@@ -2187,9 +2214,9 @@ const setupServerKeepAlive = (serverInfo: ServerInfo, serverConfig: ServerConfig
 export const initializeClientsFromSettings = async (
   isInit: boolean,
   serverName?: string,
-  options?: { reportEmbeddingProgress?: boolean },
+  options?: { reportEmbeddingProgress?: boolean; declarations?: ServerConfigWithName[]; preserveExisting?: boolean },
 ): Promise<ServerInfo[]> => {
-  const allServers: ServerConfigWithName[] = await getServerDao().findAll();
+  const allServers: ServerConfigWithName[] = options?.declarations ?? await getServerDao().findAll();
   const existingServerInfos = serverInfos;
   const nextServerInfos: ServerInfo[] = [];
   const generation = ++initGeneration;
@@ -2222,6 +2249,14 @@ export const initializeClientsFromSettings = async (
       // Expand environment variables in all configuration values
       const expandedConf = await expandServerConfig(conf);
 
+      if (options?.preserveExisting) {
+        const existing = existingServerInfos.find((info) => info.name === name);
+        if (existing) {
+          nextServerInfos.push(existing);
+          continue;
+        }
+      }
+
       // Skip disabled servers
       if (expandedConf.enabled === false) {
         logger.log(`Skipping disabled server: ${name}`);
@@ -2229,6 +2264,7 @@ export const initializeClientsFromSettings = async (
           name,
           owner: expandedConf.owner,
           visibility: expandedConf.visibility,
+          sharedWithUserGroups: expandedConf.sharedWithUserGroups,
           sharedWithUsers: expandedConf.sharedWithUsers,
           status: 'disconnected',
           error: null,
@@ -2247,6 +2283,7 @@ export const initializeClientsFromSettings = async (
           name,
           owner: expandedConf.owner,
           visibility: expandedConf.visibility,
+          sharedWithUserGroups: expandedConf.sharedWithUserGroups,
           sharedWithUsers: expandedConf.sharedWithUsers,
           enabled: true,
           status: 'disconnected',
@@ -2283,6 +2320,7 @@ export const initializeClientsFromSettings = async (
         Object.assign(onDemandInfo, {
           owner: expandedConf.owner,
           visibility: expandedConf.visibility,
+          sharedWithUserGroups: expandedConf.sharedWithUserGroups,
           sharedWithUsers: expandedConf.sharedWithUsers,
           enabled: true,
           config: expandedConf,
@@ -2323,6 +2361,7 @@ export const initializeClientsFromSettings = async (
         Object.assign(existingServer, {
           owner: expandedConf.owner,
           visibility: expandedConf.visibility,
+          sharedWithUserGroups: expandedConf.sharedWithUserGroups,
           sharedWithUsers: expandedConf.sharedWithUsers,
           enabled: expandedConf.enabled === undefined ? true : expandedConf.enabled,
         });
@@ -2353,6 +2392,7 @@ export const initializeClientsFromSettings = async (
             name,
             owner: expandedConf.owner,
             visibility: expandedConf.visibility,
+            sharedWithUserGroups: expandedConf.sharedWithUserGroups,
             sharedWithUsers: expandedConf.sharedWithUsers,
             status: 'disconnected',
             error: 'Missing OpenAPI specification URL or schema',
@@ -2369,6 +2409,7 @@ export const initializeClientsFromSettings = async (
           name,
           owner: expandedConf.owner,
           visibility: expandedConf.visibility,
+          sharedWithUserGroups: expandedConf.sharedWithUserGroups,
           sharedWithUsers: expandedConf.sharedWithUsers,
           status: 'connecting',
           error: null,
@@ -2474,6 +2515,7 @@ export const initializeClientsFromSettings = async (
             name,
             owner: expandedConf.owner,
             visibility: expandedConf.visibility,
+            sharedWithUserGroups: expandedConf.sharedWithUserGroups,
             sharedWithUsers: expandedConf.sharedWithUsers,
             status: 'disconnected',
             error: `Failed to create transport: ${formatErrorForLogging(error)}`,
@@ -2511,6 +2553,7 @@ export const initializeClientsFromSettings = async (
         name,
         owner: expandedConf.owner,
         visibility: expandedConf.visibility,
+        sharedWithUserGroups: expandedConf.sharedWithUserGroups,
         sharedWithUsers: expandedConf.sharedWithUsers,
         status: 'connecting',
         recovery: existingServer?.recovery,
@@ -2747,6 +2790,25 @@ export const initializeClientsFromSettings = async (
   return serverInfos;
 };
 
+export const reconcileReplicaServers = async (declarations: ServerConfigWithName[]): Promise<void> => {
+  const expanded = new Map<string, ServerConfig>();
+  for (const declaration of declarations) {
+    const resolved = await expandServerConfig(declaration);
+    validateCredentialTemplate(resolved);
+    validateMaxBufferSize(resolved.options?.maxBufferSize);
+    expanded.set(declaration.name, resolved);
+  }
+  const changed = serverInfos.filter((info) =>
+    !isDeepStrictEqual(info.config, expanded.get(info.name)) ||
+    (info.enabled !== false) !== (expanded.get(info.name)?.enabled !== false));
+  for (const info of changed) closeServer(info.name);
+  serverInfos = serverInfos.filter((info) => !changed.includes(info));
+  await initializeClientsFromSettings(false, undefined, { declarations, preserveExisting: true });
+  broadcastToolListChanged();
+  broadcastResourceListChanged();
+  broadcastPromptListChanged();
+};
+
 // Register all MCP tools
 export const registerAllTools = async (
   isInit: boolean,
@@ -2796,6 +2858,7 @@ export const getServersInfo = async (
         name: server.name,
         owner: server.owner,
         visibility: server.visibility,
+        sharedWithUserGroups: server.sharedWithUserGroups,
         sharedWithUsers: server.sharedWithUsers,
         // Newly created servers that are enabled should appear as "connecting"
         // until the MCP client initialization completes. Disabled servers remain
@@ -5466,6 +5529,7 @@ const handleReadResourceRequestImpl = async (request: any, extra: any) => {
 
 // Preserve credential-safe errors for personal clients in every discovery scope.
 const personalClientMethods = new Set([
+  'connect',
   'callTool',
   'getPrompt',
   'readResource',
@@ -5474,12 +5538,36 @@ const personalClientMethods = new Set([
   'listResources',
   'listResourceTemplates',
 ]);
+
+const protectReplicaOAuthClient = <T extends object>(client: T, name: string, definition: ServerConfig): T => {
+  if (!isReplicaMode() || !definition.url || !definition.oauth) return client;
+  return new Proxy(client, {
+    get(target, property) {
+      const value = Reflect.get(target, property);
+      if (typeof value !== 'function') return value;
+      if (!personalClientMethods.has(String(property))) return value.bind(target);
+      return (...args: unknown[]) => {
+        const personal = personalOAuthContexts.get(definition);
+        const scope = JSON.stringify(['oauth', name, personal?.username || 'shared']);
+        return withReplicaLock(scope, async () => {
+          if (personal) {
+            await personal.assertCurrent();
+            const binding = await getCredentialBindingDao().get(name, personal.username);
+            if (binding?.encryptedValues !== personal.version)
+              throw new Error('Personal authorization changed; retry with current credentials');
+          }
+          return value.apply(target, args);
+        });
+      };
+    },
+  });
+};
 const protectPersonalClient = <T extends object>(
   client: T,
   info: ServerInfo,
   resolvedConfig: ServerConfig,
 ): T =>
-  new Proxy(client, {
+  new Proxy(protectReplicaOAuthClient(client, info.name, resolvedConfig), {
     get(target, property) {
       const value = Reflect.get(target, property);
       if (typeof value !== 'function') return value;
@@ -5515,6 +5603,7 @@ const createPrincipalRuntime = async (
     name,
     owner: resolvedConfig.owner,
     visibility: resolvedConfig.visibility,
+    sharedWithUserGroups: resolvedConfig.sharedWithUserGroups,
     sharedWithUsers: resolvedConfig.sharedWithUsers,
     enabled: true,
     config: resolvedConfig,
@@ -5558,10 +5647,10 @@ const createPrincipalRuntime = async (
       );
       info.transport = transport;
       info.client = protectPersonalClient(client, info, resolvedConfig);
-      await client.connect(transport, resolvedConfig.options || {});
+      await info.client.connect(transport, resolvedConfig.options || {});
       const capabilities = client.getServerCapabilities();
       if (capabilities?.tools) {
-        const { tools } = await client.listTools({}, resolvedConfig.options);
+        const { tools } = await info.client.listTools({}, resolvedConfig.options);
         info.tools = preserveListFreshness(
           tools,
           tools.map((tool) => normalizeToolForCache(name, tool)),
@@ -5937,6 +6026,7 @@ const listProjectionInputs = async (group: string | undefined, field: ListField)
       enabled: info.enabled,
       owner: info.owner,
       visibility: info.visibility,
+      sharedWithUserGroups: info.sharedWithUserGroups,
       sharedWithUsers: info.sharedWithUsers,
       config: info.config,
     })),
@@ -6131,8 +6221,50 @@ const withToolPolicy = async (
 
 export const handleListToolsRequest = (request: any, extra: any) =>
   withToolPolicy(listToolsWithPrincipal, request, extra, false);
+
+// Polling refreshes connections; authorization always reads the current shared records.
+const withReplicaServerScope = async <T>(action: () => Promise<T>): Promise<T> => {
+  if (!isReplicaMode()) return action();
+  const context = UserContextService.getInstance();
+  const current = context.getCurrentUser() as (IUser & RequestPrincipal) | null;
+  const externalPrincipal = current?.credentialEligible === false ||
+    RequestContextService.getInstance().getHostedAuthContext();
+  const user = current ? externalPrincipal ? current : await getUserDao().findByUsername(current.username) : null;
+  if (current && !user) throw new Error('User no longer exists');
+  const definitions = getDataService().filterData(await getServerDao().findAll(), user ?? undefined);
+  const byName = new Map<string, ServerConfigWithName>(definitions.map((server) => [server.name, server]));
+  const visible = (principalServerScope.getStore() ?? serverInfos).flatMap((info) => {
+    const live = byName.get(info.name);
+    if (!live || live.enabled === false) return [];
+    if (hasPersonalAuthentication(live) !== hasPersonalAuthentication(info.config)) return [];
+    // Project request authorization while keeping all lifecycle reads/writes on the runtime.
+    return [
+      new Proxy(info, {
+        get(target, property) {
+          switch (property) {
+            case 'owner':
+            case 'visibility':
+            case 'sharedWithUsers':
+            case 'sharedWithUserGroups':
+              return live[property];
+            case 'config':
+              return {
+                ...target.config,
+                tools: live.tools,
+                prompts: live.prompts,
+                resources: live.resources,
+              };
+            default:
+              return Reflect.get(target, property);
+          }
+        },
+      }),
+    ];
+  });
+  return context.runWithContext(() => principalServerScope.run(visible, action), user ?? null);
+};
 export const handleCallToolRequest = (request: any, extra: any) =>
-  observeToolCall(() => withToolPolicy(callToolWithPrincipal, request, extra, true));
+  observeToolCall(() => withReplicaServerScope(() => withToolPolicy(callToolWithPrincipal, request, extra, true)));
 export const handleGetPromptRequest = withPrincipalServers(
   withModernLists(handleGetPromptRequestImpl, ['prompts']),
   'prompt',

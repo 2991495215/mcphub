@@ -106,7 +106,11 @@ const buildOAuthConfig = (
       nextOAuth.scopes = parsedScopes;
     }
   }
-  if (accessToken && oauth.identityMode !== 'personal') nextOAuth.accessToken = accessToken;
+  if (accessToken && oauth.identityMode !== 'personal') {
+    nextOAuth.accessToken = accessToken;
+    if (oauth.accessTokenExpiresAt !== undefined)
+      nextOAuth.accessTokenExpiresAt = oauth.accessTokenExpiresAt;
+  }
   if (refreshToken && oauth.identityMode !== 'personal') nextOAuth.refreshToken = refreshToken;
   if (authorizationEndpoint) nextOAuth.authorizationEndpoint = authorizationEndpoint;
   if (tokenEndpoint) nextOAuth.tokenEndpoint = tokenEndpoint;
@@ -121,6 +125,7 @@ const buildOAuthConfig = (
   // declared once on `ServerFormData['oauth']` (frontend/src/types/index.ts),
   // so they can be read directly here; a key is only emitted when the form
   // actually carries it.
+  if (oauth.authorizationRelay) nextOAuth.authorizationRelay = oauth.authorizationRelay;
   if (oauth.authorizationServerMetadata) {
     nextOAuth.authorizationServerMetadata = oauth.authorizationServerMetadata;
   }
@@ -253,6 +258,10 @@ export const buildServerPayload = ({
     description,
     options,
     visibility: formData.visibility ?? 'private',
+    sharedWithUserGroups:
+      formData.visibility === 'group'
+        ? normalizeSharedUsers(formData.sharedWithUserGroups)
+        : undefined,
     sharedWithUsers:
       formData.visibility === 'group' ? normalizeSharedUsers(formData.sharedWithUsers) : undefined,
     credentialTemplate: formData.credentialTemplate?.map((slot) => ({

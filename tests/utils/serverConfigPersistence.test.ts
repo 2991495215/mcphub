@@ -2,6 +2,15 @@ import { normalizeServerConfigForPersistence } from '../../src/utils/serverConfi
 import { ServerConfig, ServerInfo } from '../../src/types/index.js';
 
 describe('normalizeServerConfigForPersistence', () => {
+  it('preserves absolute OAuth expiry alongside its shared access token', () => {
+    const config = {
+      type: 'streamable-http' as const,
+      url: 'https://example.com/mcp',
+      oauth: { accessToken: 'opaque', accessTokenExpiresAt: 12345 },
+    };
+    expect(normalizeServerConfigForPersistence(config).oauth?.accessTokenExpiresAt).toBe(12345);
+  });
+
   it('keeps remote keep-alive checks disabled by default', () => {
     const normalized = normalizeServerConfigForPersistence({
       type: 'streamable-http',
@@ -448,5 +457,42 @@ describe('explicit OAuth authorization server metadata', () => {
         },
       }),
     ).toThrow('Invalid oauth.authorizationServerMetadata');
+  });
+});
+
+describe('authorization relay configuration', () => {
+  const oauth = {
+    identityMode: 'personal' as const,
+    authorizationServerMetadata: {
+      issuer: 'http://broker.internal',
+      authorization_endpoint: 'http://broker.internal/authorize',
+      token_endpoint: 'http://broker.internal/token',
+      response_types_supported: ['code'],
+    },
+    authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] },
+  };
+  it('preserves relay settings', () => {
+    const normalized = normalizeServerConfigForPersistence({
+      type: 'streamable-http',
+      url: 'http://broker.internal/mcp',
+      oauth,
+    });
+    expect(normalized.oauth?.authorizationRelay).toEqual(oauth.authorizationRelay);
+  });
+  it.each([
+    { identityMode: 'shared' },
+    { authorizationServerMetadata: undefined },
+    { authorizationRelay: true },
+    { authorizationRelay: { allowedRedirectOrigins: [] } },
+    { authorizationRelay: { allowedRedirectOrigins: ['http://login.example.com'] } },
+    { authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com/path'] } },
+  ])('rejects invalid relay declaration %j', (invalid) => {
+    expect(() =>
+      normalizeServerConfigForPersistence({
+        type: 'streamable-http',
+        url: 'http://broker.internal/mcp',
+        oauth: { ...oauth, ...invalid } as typeof oauth,
+      }),
+    ).toThrow('Invalid oauth.authorizationRelay');
   });
 });

@@ -159,7 +159,7 @@ describe('serverController - server share candidates', () => {
     mockUserDao.findAll.mockResolvedValue([
       { username: 'charlie', password: 'secret', isAdmin: false },
       { username: 'bob', password: 'secret', isAdmin: false },
-      { username: 'alice', password: 'secret', isAdmin: false },
+      { username: 'alice', password: 'secret', isAdmin: false, userGroups: ['readers', 'readers'] },
     ]);
   });
 
@@ -178,6 +178,7 @@ describe('serverController - server share candidates', () => {
     expect(json).toHaveBeenCalledWith({
       success: true,
       data: ['alice', 'charlie'],
+      userGroups: ['readers'],
     });
   });
 
@@ -207,6 +208,7 @@ describe('serverController - server share candidates', () => {
     expect(json).toHaveBeenCalledWith({
       success: true,
       data: ['alice', 'charlie'],
+      userGroups: [],
     });
   });
 
@@ -840,6 +842,21 @@ describe('serverController - updateSystemConfig', () => {
     mockSystemConfigDao.update.mockResolvedValue(true);
   });
 
+  it('updates remembered OAuth consent settings without unrelated config fields', async () => {
+    mockRequest.body = { oauthServer: { alwaysShowApprovalScreen: false, approvalLifetime: 86400 } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockSystemConfigDao.update).toHaveBeenCalledWith(expect.objectContaining({
+      oauthServer: expect.objectContaining({ alwaysShowApprovalScreen: false, approvalLifetime: 86400 }),
+    }));
+  });
+
+  it.each([0, -1, 1.5, Infinity, 31536001, '86400', null])('rejects invalid OAuth approval lifetimes (%s)', async (approvalLifetime) => {
+    mockRequest.body = { oauthServer: { alwaysShowApprovalScreen: false, approvalLifetime } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockStatus).toHaveBeenCalledWith(400);
+    expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
+  });
+
   it.each([['  Team MCP  ', 'Team MCP'], ['   ', ''], ['x'.repeat(100), 'x'.repeat(100)]])(
     'saves a trimmed dashboard name and allows resetting it', async (dashboardName, expected) => {
       mockRequest.body = { dashboardName };
@@ -889,6 +906,35 @@ describe('serverController - updateSystemConfig', () => {
       );
     }
   });
+
+  it('saves scoped Fake-IP rules', async () => {
+    const fakeIpExceptions = [{ serverId: 'trusted', hostname: 'mcp.example.com' }];
+    mockRequest.body = { network: { fakeIpExceptions } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockSystemConfigDao.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ network: expect.objectContaining({ fakeIpExceptions }) }),
+    );
+  });
+
+  it('preserves scoped rules when the dashboard updates CIDRs', async () => {
+    const fakeIpExceptions = [{ serverId: 'trusted', hostname: 'mcp.example.com' }];
+    mockSystemConfigDao.get.mockResolvedValue({ network: { fakeIpExceptions } });
+    mockRequest.body = { network: { allowedCidrs: [] } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockSystemConfigDao.update).toHaveBeenLastCalledWith(
+      expect.objectContaining({ network: { fakeIpExceptions, allowedCidrs: [] } }),
+    );
+  });
+
+  it.each([null, [{}], [{ serverId: 'trusted', hostname: '*' }]])(
+    'rejects invalid Fake-IP rules %s',
+    async (fakeIpExceptions) => {
+      mockRequest.body = { network: { fakeIpExceptions } };
+      await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+      expect(mockStatus).toHaveBeenCalledWith(400);
+      expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([null, {}, { allowedCidrs: '192.168.1.0/24' }, { allowedCidrs: ['192.168.1.0/33'] }])(
     'rejects invalid network configuration %s without saving',
@@ -945,6 +991,31 @@ describe('serverController - updateSystemConfig', () => {
         }),
       }),
     );
+  });
+
+  it.each([true, false])('persists the Authorization passthrough opt-in: %s', async (enabled) => {
+    mockRequest.body = { routing: { allowAuthorizationPassthrough: enabled } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockSystemConfigDao.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        routing: expect.objectContaining({ allowAuthorizationPassthrough: enabled }),
+      }),
+    );
+  });
+
+  it('rejects non-boolean Authorization passthrough settings', async () => {
+    mockRequest.body = { routing: { allowAuthorizationPassthrough: 'true' } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockStatus).toHaveBeenCalledWith(400);
+    expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-admin Authorization passthrough opt-in', async () => {
+    mockRequest.user = { username: 'regular-user', isAdmin: false };
+    mockRequest.body = { routing: { allowAuthorizationPassthrough: true } };
+    await updateSystemConfig(mockRequest as Request, mockResponse as Response);
+    expect(mockStatus).toHaveBeenCalledWith(403);
+    expect(mockSystemConfigDao.update).not.toHaveBeenCalled();
   });
 
   it('persists a positive embedding dimension setting', async () => {
@@ -1494,7 +1565,8 @@ describe('serverController - resetToolDescription', () => {
     await resetToolDescription(mockRequest as Request, mockResponse as Response);
 
     expect(mockServerDao.updateTools).toHaveBeenCalledWith('test-server', {});
-    expect(mockNotifyToolChanged).toHaveBeenCalled();
+    expect(mockBroadcastToolListChanged).toHaveBeenCalledTimes(1);
+    expect(mockNotifyToolChanged).not.toHaveBeenCalled();
     expect(mockSyncToolEmbedding).toHaveBeenCalledWith('test-server', 'test-server::search');
     expect(mockJson).toHaveBeenCalledWith({
       success: true,
@@ -1613,7 +1685,7 @@ describe('serverController - updateServer', () => {
       keepAliveInterval: 60000,
       openapi: undefined,
     });
-    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'public', undefined);
+    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'public', undefined, undefined);
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
     expect(mockNotifyToolChanged).not.toHaveBeenCalled();
@@ -1645,7 +1717,7 @@ describe('serverController - updateServer', () => {
         sharedWithUsers: ['bob'],
       }),
     );
-    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'group', ['bob']);
+    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'group', ['bob'], undefined);
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
   });
@@ -1677,7 +1749,7 @@ describe('serverController - updateServer', () => {
     await updateServer(mockRequest as Request, mockResponse as Response);
 
     expect(mockServerDao.update).toHaveBeenCalled();
-    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'public', undefined);
+    expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'public', undefined, undefined);
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
     expect(mockNotifyToolChanged).not.toHaveBeenCalled();
@@ -1718,7 +1790,7 @@ describe('serverController - updateServer', () => {
     expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'group', [
       'alice',
       'bob',
-    ]);
+    ], undefined);
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
     expect(mockNotifyToolChanged).not.toHaveBeenCalled();
@@ -1771,7 +1843,7 @@ describe('serverController - updateServer', () => {
     expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith('test-server', 'group', [
       'admin2',
       'test2',
-    ]);
+    ], undefined);
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
     expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
     expect(mockNotifyToolChanged).not.toHaveBeenCalled();
@@ -1811,6 +1883,7 @@ describe('serverController - updateServer', () => {
     expect(mockUpdateServerInfoVisibility).toHaveBeenCalledWith(
       'test-server',
       'private',
+      undefined,
       undefined,
     );
     expect(mockBroadcastToolListChanged).toHaveBeenCalled();
@@ -3334,7 +3407,8 @@ describe('batchToggleTools', () => {
     expect(live.config.tools).toEqual({
       delete_a: { enabled: false, description: 'Keep', hiddenParams: ['secret'] },
     });
-    expect(mockNotifyToolChanged).toHaveBeenCalledTimes(1);
+    expect(mockBroadcastToolListChanged).toHaveBeenCalledTimes(1);
+    expect(mockNotifyToolChanged).not.toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({
         success: true,
@@ -3459,5 +3533,39 @@ describe('batchToggleTools', () => {
     await batchToggleTools(request({ enabled: false, tools: ['*'] }), res);
     expect(res.status).toHaveBeenCalledWith(409);
     expect(mockServerDao.updateTools).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('admin-controlled authorization relay', () => {
+  const config = {
+    type: 'streamable-http', url: 'http://broker.internal/mcp',
+    oauth: {
+      identityMode: 'personal',
+      authorizationServerMetadata: {
+        issuer: 'http://broker.internal', authorization_endpoint: 'http://broker.internal/authorize',
+        token_endpoint: 'http://broker.internal/token', response_types_supported: ['code'],
+      },
+      authorizationRelay: { allowedRedirectOrigins: ['https://login.example.com'] },
+    },
+  };
+  it.each([createServer, updateServer, batchCreateServers])('rejects non-admin relay writes through %p', async (handler) => {
+    jest.clearAllMocks();
+    mockServerDao.findById.mockResolvedValue({ name: 'broker', owner: 'alice', ...config });
+    const status = jest.fn().mockReturnThis();
+    const json = jest.fn();
+    await handler({ params: { name: 'broker' }, body: { name: 'broker', config, servers: [{ name: 'broker', config }] }, user: { username: 'alice', isAdmin: false } } as unknown as Request, { status, json } as unknown as Response);
+    expect(mockAddServer).not.toHaveBeenCalled();
+    expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
+    if (handler === batchCreateServers) expect(json).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ failureCount: 1 }) }));
+    else expect(status).toHaveBeenCalledWith(403);
+  });
+  it('prevents a non-admin owner from removing relay and changing its target', async () => {
+    jest.clearAllMocks();
+    mockServerDao.findById.mockResolvedValue({ name: 'broker', owner: 'alice', ...config });
+    const status = jest.fn().mockReturnThis();
+    await updateServer({ params: { name: 'broker' }, body: { config: { type: 'streamable-http', url: 'https://another.example/mcp' } }, user: { username: 'alice', isAdmin: false } } as unknown as Request, { status, json: jest.fn() } as unknown as Response);
+    expect(status).toHaveBeenCalledWith(403);
+    expect(mockAddOrUpdateServer).not.toHaveBeenCalled();
   });
 });

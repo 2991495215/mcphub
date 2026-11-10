@@ -14,6 +14,7 @@ import {
   isLegacyRequest,
 } from '@modelcontextprotocol/server';
 import { deleteMcpServer, getMcpServer } from './mcpService.js';
+import { mcpEventBus } from './mcpEventBus.js';
 import config from '../config/index.js';
 import {
   getBearerKeyDao,
@@ -30,6 +31,7 @@ import { bearerKeyMatches } from '../utils/bearerKeyToken.js';
 import {
   getBearerAuthHeaderValue,
   getBearerTokenFromHeaders,
+  getForwardAuthTokenFromHeaders,
   parseBearerAuthorization,
 } from '../utils/bearerAuth.js';
 import {
@@ -42,6 +44,7 @@ import { isHostedModeEnabled } from './hostedMode.js';
 import { authenticateForwardAuthToken } from './forwardAuthService.js';
 import { getPublicResourceUrl, getResourceMetadataUrl } from '../utils/protectedResource.js';
 import { logger } from '../utils/logger.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
 
 export interface SessionContext {
   transport: Transport;
@@ -49,6 +52,7 @@ export interface SessionContext {
   needsInitialization?: boolean;
   keyId?: string;
   keyName?: string;
+  excludedServerNames?: string[];
   hostedAuth?: HostedAuthContext;
 }
 
@@ -92,6 +96,7 @@ const getModernMcpNodeHandler = (): ReturnType<typeof toNodeHandler> => {
     },
     {
       legacy: 'reject',
+      bus: mcpEventBus,
       onerror: (error) => {
         logger.error('[MCP 2026] Modern handler error:', error);
       },
@@ -181,6 +186,7 @@ type BearerAuthResult =
       keyId?: string;
       keyName?: string;
       kind?: BearerKeyKind;
+      excludedServerNames?: string[];
       hostedAuth?: HostedAuthContext;
     }
   | {
@@ -247,6 +253,32 @@ const groupRouteReferencesMatch = async (
   return Boolean(requested && session && requested.id === session.id);
 };
 
+const getGroupServerNames = (servers: unknown): string[] => {
+  if (!Array.isArray(servers)) return [];
+  return servers.map((server) =>
+    typeof server === 'string' ? server : (server as { name?: string })?.name,
+  ).filter((name): name is string => typeof name === 'string' && name.length > 0);
+};
+
+// 'exclude'-scoped keys deny named servers plus every member of a named group.
+// Stale references fail safe: they only deny something that no longer exists.
+const resolveExcludedServerNames = async (key: BearerKey): Promise<string[]> => {
+  const excluded = new Set<string>(key.excludedServers ?? []);
+  const excludedGroups = key.excludedGroups ?? [];
+  if (excludedGroups.length === 0) return [...excluded];
+
+  const groupDao = getGroupDao();
+  for (const reference of excludedGroups) {
+    const group =
+      (await groupDao.findByName(reference)) ||
+      (isValidUUID(reference) ? await groupDao.findById(reference) : null);
+    for (const name of getGroupServerNames(group?.servers)) {
+      excluded.add(name);
+    }
+  }
+  return [...excluded];
+};
+
 const isBearerKeyAllowedForRequest = async (req: Request, key: BearerKey): Promise<boolean> => {
   if (key.kind === 'user') {
     return true;
@@ -259,15 +291,18 @@ const isBearerKeyAllowedForRequest = async (req: Request, key: BearerKey): Promi
     return true;
   }
 
-  // No parameter value means global route
+  // No parameter value means global route. 'exclude' keys may use it; the
+  // per-server exclusions are applied to the listings and calls themselves.
   if (!paramValue) {
-    // Only accessType 'all' allows global routes
-    return false;
+    return key.accessType === 'exclude';
   }
 
   try {
     const groupDao = getGroupDao();
     const serverDao = getServerDao();
+    const isExcludeScope = key.accessType === 'exclude';
+    const excludedGroups = isExcludeScope ? (key.excludedGroups ?? []) : [];
+    const excludedServers = isExcludeScope ? new Set(await resolveExcludedServerNames(key)) : null;
 
     // Step 1: Try to match as a group (by name or id), since group has higher priority
     let matchedGroup = await groupDao.findByName(paramValue);
@@ -278,6 +313,21 @@ const isBearerKeyAllowedForRequest = async (req: Request, key: BearerKey): Promi
 
     if (matchedGroup) {
       // Matched as a group
+      if (isExcludeScope) {
+        if (excludedGroups.includes(matchedGroup.name) || excludedGroups.includes(matchedGroup.id)) {
+          return false;
+        }
+        const groupServerNames = getGroupServerNames(matchedGroup.servers);
+        // Reject when nothing would remain, rather than exposing an empty catalog.
+        if (
+          groupServerNames.length > 0 &&
+          groupServerNames.every((name) => excludedServers!.has(name))
+        ) {
+          return false;
+        }
+        return true;
+      }
+
       if (key.accessType === 'groups') {
         // For group-scoped keys, check if the matched group is in allowedGroups
         const allowedGroups = key.allowedGroups || [];
@@ -343,6 +393,10 @@ const isBearerKeyAllowedForRequest = async (req: Request, key: BearerKey): Promi
 
     if (matchedServer) {
       // Matched as a server
+      if (isExcludeScope) {
+        return !excludedServers!.has(matchedServer.name);
+      }
+
       if (key.accessType === 'groups') {
         // For group-scoped keys, server access is not allowed
         return false;
@@ -369,6 +423,16 @@ const isBearerKeyAllowedForRequest = async (req: Request, key: BearerKey): Promi
   }
 };
 
+const attachExcludedServerNames = async (
+  key: BearerKey,
+  result: Extract<BearerAuthResult, { valid: true }>,
+): Promise<BearerAuthResult> => {
+  if (key.kind === 'user' || key.accessType !== 'exclude') {
+    return result;
+  }
+  return { ...result, excludedServerNames: await resolveExcludedServerNames(key) };
+};
+
 const resolveUserLevelKeyUser = async (req: Request, key: BearerKey): Promise<BearerAuthResult> => {
   if (key.kind !== 'user') {
     return { valid: true, keyId: key.id, keyName: key.name, kind: key.kind || 'system' };
@@ -389,6 +453,15 @@ const resolveUserLevelKeyUser = async (req: Request, key: BearerKey): Promise<Be
   }
 
   return { valid: true, user, keyId: key.id, keyName: key.name, kind: 'user' };
+};
+
+// User routes only accept the matching user, whichever credential selected it.
+const oauthUserResult = (req: Request, user: IUser): BearerAuthResult => {
+  const requestedUsername = req.params.user;
+  if (requestedUsername && requestedUsername !== user.username) {
+    return { valid: false, reason: 'forbidden' };
+  }
+  return { valid: true, user, keyName: OAUTH_AUTH_METHOD_LABEL };
 };
 
 const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
@@ -442,7 +515,10 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
 
   // Forward auth runs before keys and OAuth tokens: a JWT from the configured
   // issuer either authenticates here or is rejected, with no fallback.
-  const forwardAuthResult = await authenticateForwardAuthToken(presentedToken, systemConfig);
+  const forwardAuthResult = await authenticateForwardAuthToken(
+    getForwardAuthTokenFromHeaders(req.headers, systemConfig),
+    systemConfig,
+  );
   if (forwardAuthResult.status === 'rejected') {
     return { valid: false, reason: 'invalid' };
   }
@@ -480,7 +556,7 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
         logger.log(
           `Bearer key recognized (auth disabled): id=${matchingKey.id}, name=${matchingKey.name}, accessType=${matchingKey.accessType}`,
         );
-        return userKeyResult;
+        return attachExcludedServerNames(matchingKey, userKeyResult);
       }
 
       logger.warn(
@@ -492,7 +568,7 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     const oauthUser = await resolveOAuthUserFromToken(token);
     if (oauthUser) {
       logger.log('Recognized OAuth bearer token (auth disabled)');
-      return { valid: true, user: oauthUser, keyName: OAUTH_AUTH_METHOD_LABEL };
+      return oauthUserResult(req, oauthUser);
     }
 
     return { valid: true };
@@ -511,7 +587,7 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     const oauthUser = await resolveOAuthUserFromToken(token);
     if (oauthUser) {
       logger.log('Authenticated request using OAuth bearer token without configured keys');
-      return { valid: true, user: oauthUser, keyName: OAUTH_AUTH_METHOD_LABEL };
+      return oauthUserResult(req, oauthUser);
     }
 
     logger.warn(
@@ -537,13 +613,13 @@ const validateBearerAuth = async (req: Request): Promise<BearerAuthResult> => {
     logger.log(
       `Bearer key authenticated: id=${matchingKey.id}, name=${matchingKey.name}, accessType=${matchingKey.accessType}`,
     );
-    return userKeyResult;
+    return attachExcludedServerNames(matchingKey, userKeyResult);
   }
 
   const oauthUser = await resolveOAuthUserFromToken(token);
   if (oauthUser) {
     logger.log('Authenticated request using OAuth bearer token (no matching static key)');
-    return { valid: true, user: oauthUser, keyName: OAUTH_AUTH_METHOD_LABEL };
+    return oauthUserResult(req, oauthUser);
   }
 
   logger.warn('Bearer authentication failed: token did not match any key or OAuth user');
@@ -715,6 +791,7 @@ export const handleSseConnection = async (req: Request, res: Response): Promise<
     group: group,
     keyId: bearerAuthResult.keyId,
     keyName: bearerAuthResult.keyName,
+    excludedServerNames: bearerAuthResult.excludedServerNames,
     hostedAuth: bearerAuthResult.hostedAuth,
   };
 
@@ -773,7 +850,7 @@ export const handleSseMessage = async (req: Request, res: Response): Promise<voi
     return;
   }
 
-  const { transport, group, keyId, keyName } = transportData;
+  const { transport, group, keyId, keyName, excludedServerNames } = transportData;
   req.params.group = group;
   req.query.group = group;
   logger.log(
@@ -792,6 +869,9 @@ export const handleSseMessage = async (req: Request, res: Response): Promise<voi
     requestContextService.setUsernameContext(username);
     requestContextService.setHostedAuthContext(currentHostedAuth);
     requestContextService.setKeyKindContext(bearerAuthResult.kind);
+    requestContextService.setBearerKeyExclusions(
+      bearerAuthResult.excludedServerNames ?? excludedServerNames,
+    );
 
     await (transport as SSEServerTransport).handlePostMessage(req, res);
   });
@@ -943,6 +1023,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
       requestContextService.setGroupContext(group);
       requestContextService.setUsernameContext(username);
       requestContextService.setKeyKindContext(bearerAuthResult.kind);
+      requestContextService.setBearerKeyExclusions(bearerAuthResult.excludedServerNames);
       requestContextService.setHostedAuthContext(bearerAuthResult.hostedAuth);
 
       const context = requestContextService.getRequestContext()!;
@@ -952,7 +1033,10 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
       context.clientCapabilities = requestMeta?.['io.modelcontextprotocol/clientCapabilities'];
       // Bind application state to the authenticated credential, user and route.
       // Never treat caller-provided correlation metadata as identity.
-      const token = getBearerTokenFromHeaders(req.headers, systemConfig);
+      const token =
+        bearerAuthResult.keyName === FORWARD_AUTH_METHOD_LABEL
+          ? getForwardAuthTokenFromHeaders(req.headers, systemConfig)
+          : getBearerTokenFromHeaders(req.headers, systemConfig);
       if (token && (systemConfig?.routing?.enableBearerAuth ?? true)) {
         context.clientStateScope = createHash('sha256')
           .update(JSON.stringify([token, username || '', group || '']))
@@ -979,7 +1063,7 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
     transport = transportInfo.transport as NodeStreamableHTTPServerTransport;
   } else if (sessionId) {
     // Case 2: SessionId exists but transport is missing (server restart), check if session rebuild is enabled
-    const enableSessionRebuild = systemConfig?.enableSessionRebuild || false;
+    const enableSessionRebuild = !isReplicaMode() && (systemConfig?.enableSessionRebuild || false);
 
     if (enableSessionRebuild) {
       logger.log(
@@ -1076,6 +1160,9 @@ export const handleMcpPostRequest = async (req: Request, res: Response): Promise
     requestContextService.setGroupContext(group);
     requestContextService.setUsernameContext(username);
     requestContextService.setKeyKindContext(bearerAuthResult.kind);
+    requestContextService.setBearerKeyExclusions(
+      bearerAuthResult.excludedServerNames ?? transportInfo?.excludedServerNames,
+    );
     requestContextService.setHostedAuthContext(
       bearerAuthResult.hostedAuth || transportInfo?.hostedAuth,
     );
@@ -1135,7 +1222,7 @@ export const handleMcpOtherRequest = async (req: Request, res: Response) => {
   if (!transportEntry) {
     const systemConfigDao = getSystemConfigDao();
     const systemConfig = await systemConfigDao.get();
-    const enableSessionRebuild = systemConfig?.enableSessionRebuild || false;
+    const enableSessionRebuild = !isReplicaMode() && (systemConfig?.enableSessionRebuild || false);
 
     if (enableSessionRebuild) {
       logger.log(

@@ -10,6 +10,9 @@ MCPHub reads the following environment variables at startup. The authoritative l
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `3000` | HTTP server port. |
+| `MCPHUB_REPLICA_MODE` | `false` | Opt in to [multi-replica deployment](/configuration/replicas). Requires PostgreSQL, persistent shared keys, and `DB_SYNCHRONIZE=false`. |
+| `MCPHUB_NODE_ID` | hostname | Node identity in replica diagnostics, response headers, logs and metrics. |
+| `DB_SYNCHRONIZE` | `true` | Set to `false` on serving replicas; run `pnpm db:setup` separately with this set to `true`. |
 | `BASE_PATH` | `''` | Mount-point prefix when MCPHub is served under a sub-path (e.g. `/mcphub`). |
 | `SMART_ROUTING_PATH` | `$smart` | Smart Routing path segment, e.g. `my_smart` for `/mcp/my_smart`. Use 1–64 ASCII letters, digits, hyphens or underscores. Restart required. The legacy `$smart` endpoint remains available. Server/group names and group IDs must not conflict with this value. |
 | `DEFAULT_REQUEST_TIMEOUT` | `60000` | Default request timeout (ms) for upstream MCP server requests when a server does not set `options.timeout`. |
@@ -109,6 +112,7 @@ Forward auth trusts a JWT issued to users by an upstream gateway and verifies it
 | `FORWARD_AUTH_ISSUER` | Expected `iss` claim. Required. |
 | `FORWARD_AUTH_AUDIENCE` | Accepted `aud` value(s). Accepts a comma-separated list or JSON array; values may contain spaces (for example `My API`). Required. |
 | `FORWARD_AUTH_ALGORITHMS` | Allowed asymmetric algorithms. Defaults to `RS256,ES256`. `HS*` and `none` are never accepted. |
+| `FORWARD_AUTH_TOKEN_HEADER` | Header that carries the JWT, raw or as `Bearer <jwt>` (for example `Cf-Access-Jwt-Assertion`). Defaults to the bearer auth header. |
 | `FORWARD_AUTH_USERNAME_CLAIM` | Claim used for the username of newly created users. Defaults to `preferred_username`. |
 | `FORWARD_AUTH_EMAIL_CLAIM` | Claim used for the email of newly created users. Defaults to `email`. |
 | `FORWARD_AUTH_AUTO_CREATE` | Create a non-admin local user for a new identity. Defaults to `true`. |

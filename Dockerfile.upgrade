@@ -1,0 +1,18 @@
+FROM security-event/mcphub:20261103-chatgpt-ui AS builder
+WORKDIR /app
+COPY --chown=nobody:nogroup . .
+RUN pnpm install --frozen-lockfile
+RUN pnpm lint
+RUN mkdir -p coverage && chown nobody:nogroup /app /app/coverage
+USER nobody
+ENV HOME=/tmp
+RUN pnpm test:ci --runInBand
+USER root
+RUN pnpm build && node scripts/verify-dist.js
+FROM security-event/mcphub:20261103-chatgpt-ui
+WORKDIR /app
+COPY --from=builder /app/node_modules/ /app/node_modules/
+COPY --from=builder /app/dist/ /app/dist/
+COPY --from=builder /app/frontend/dist/ /app/frontend/dist/
+COPY --from=builder /app/locales/ /app/locales/
+COPY --from=builder /app/package.json /app/pnpm-lock.yaml /app/

@@ -205,6 +205,7 @@ export interface MyCredentialBinding {
   credentialTemplate: CredentialSlot[];
   configured: boolean;
   configuredSlots: string[];
+  valuePreviews?: Record<string, string>;
   updatedAt: string | null;
 }
 
@@ -223,6 +224,7 @@ export interface ServerConfig {
   enabled?: boolean;
   // Per-server visibility for non-admin users.
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   protocolNegotiation?: 'auto' | 'legacy'; // Streamable HTTP defaults to auto; other transports remain legacy.
   enableKeepAlive?: boolean; // Enable remote health checks; disconnected remote servers always retry
@@ -251,6 +253,7 @@ export interface ServerConfig {
     clientSecret?: string; // OAuth client secret
     redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
+    accessTokenExpiresAt?: number;
     accessToken?: string; // Pre-obtained access token (if available)
     refreshToken?: string; // Refresh token for renewing access
     dynamicRegistration?: {
@@ -274,6 +277,7 @@ export interface ServerConfig {
       initialAccessToken?: string;
     };
     resource?: string; // OAuth resource parameter (RFC8707)
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
     authorizationServerMetadata?: {
       issuer: string;
       authorization_endpoint: string;
@@ -388,6 +392,7 @@ export interface IGroupServerConfig {
 export interface Group {
   owner?: string;
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   id: string;
   name: string;
@@ -418,6 +423,7 @@ export interface ServerFormData {
   passthroughHeaders?: string;
   // Visibility for non-admin users.
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   options?: {
     timeout?: number;
@@ -444,8 +450,10 @@ export interface ServerFormData {
     allowInsecureTokenEndpoint?: boolean;
     clientSecret?: string;
     scopes?: string;
+    accessTokenExpiresAt?: number;
     accessToken?: string;
     refreshToken?: string;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
     authorizationServerMetadata?: NonNullable<ServerConfig['oauth']>['authorizationServerMetadata'];
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
@@ -507,6 +515,7 @@ export interface ServerFormData {
 // Group form data types
 export interface GroupFormData {
   visibility?: Group['visibility'];
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   name: string;
   description: string;
@@ -523,7 +532,7 @@ export interface ApiResponse<T = any> {
 }
 
 // Bearer authentication key configuration (frontend view model)
-export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom' | 'exclude';
 export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
@@ -536,6 +545,8 @@ export interface BearerKey {
   accessType: BearerKeyAccessType;
   allowedGroups?: string[];
   allowedServers?: string[];
+  excludedGroups?: string[];
+  excludedServers?: string[];
 }
 
 // Auth types
@@ -547,6 +558,7 @@ export interface IUser {
 
 // User management types
 export interface User {
+  userGroups?: string[];
   username: string;
   isAdmin: boolean;
   email?: string;
@@ -560,6 +572,7 @@ export interface UserFormData {
 }
 
 export interface UserUpdateData {
+  userGroups?: string[];
   isAdmin?: boolean;
   newPassword?: string;
   email?: string;
@@ -850,6 +863,7 @@ export interface TemplateServerConfig {
       initialAccessToken?: string;
     };
     resource?: string;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
     authorizationServerMetadata?: NonNullable<ServerConfig['oauth']>['authorizationServerMetadata'];
     authorizationEndpoint?: string;
     tokenEndpoint?: string;
@@ -942,4 +956,14 @@ export interface OpenApiToolStats {
   definitionsBytes: number;
   estimatedTokens: number;
   declaredSecurity?: OpenAPIDeclaredSecurity;
+}
+
+export interface OAuthApproval {
+  id: string;
+  clientId: string;
+  scopes: string[];
+  redirectUri: string;
+  resource?: string;
+  approvedAt: string;
+  expiresAt: string;
 }

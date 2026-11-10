@@ -765,6 +765,38 @@ ls -la /path/to/server
 
 省略该选项时保留 SDK 默认值 10 MiB（10485760 字节）。上限用于读取包含 MCP 消息封装的序列化数据的缓冲区。响应超过上限会关闭传输连接。提高上限会允许使用更多内存，请按服务器需求设置有限上限。零、负数、小数和非有限值均被拒绝。该选项不会改变 HTTP 传输或 SDK 处理大消息的性能。
 
+## Authorization 请求头透传
+
+默认禁止透传 `Authorization`。管理员如需向可信上游传递每次请求的调用者令牌，必须在文件模式的 `mcp_settings.json` 中显式配置：
+
+```json
+{
+  "systemConfig": {
+    "routing": {
+      "bearerAuthHeaderName": "X-MCP-Authorization",
+      "allowAuthorizationPassthrough": true
+    }
+  }
+}
+```
+
+管理员也可在 **设置 → 密钥 → 允许透传 Authorization** 中开启，开启前需先保存独立的 MCPHub 鉴权头；hosted 模式不显示该开关。数据库模式还可通过仅限管理员的 `PUT /api/system-config` 提交以下请求体，调用该管理接口时使用当前配置的 MCPHub 鉴权头：
+
+```json
+{
+  "routing": {
+    "bearerAuthHeaderName": "X-MCP-Authorization",
+    "allowAuthorizationPassthrough": true
+  }
+}
+```
+
+同时，在可信服务器的 `passthroughHeaders`（HTTP MCP）或 `openapi.passthroughHeaders`（OpenAPI）中列出 `Authorization`。随后每次 MCP 请求分别发送 `X-MCP-Authorization: Bearer <mcphub-key>` 和 `Authorization: Bearer <upstream-user-token>`。
+
+`allowAuthorizationPassthrough` 默认关闭，已有部署升级后不会自动开始透传。MCPHub 实际使用的鉴权头始终禁止透传；hosted 模式始终禁止透传 `Authorization`。`Cookie`、`Proxy-Authorization`、`X-Auth-Token` 和 `X-Api-Key` 也不受此开关影响，列入配置仍不会转发。
+
+该开关作用于整个实例，只应对可信上游启用；透传配置仍只允许管理员创建或修改。静态请求头和个人凭据是独立认证方式，不能等价替代每次请求携带的调用者令牌。
+
 ## 放行内网上游网络
 
 管理员可在设置页维护**允许访问的上游 CIDR 范围**，JSON 存储模式也可配置 `systemConfig.network.allowedCidrs`：
@@ -786,6 +818,30 @@ ls -la /path/to/server
 只有管理员可调用 `PUT /api/system-config`，请求体为 `{"network":{"allowedCidrs":["192.168.1.0/24"]}}`。传入空数组可清空白名单，非法列表返回 HTTP 400 且不会保存。数据库模式请通过管理界面或 API 配置，该字段持久化到系统配置表。
 
 请仅放行必要的最小范围。`0.0.0.0/0` 或 `::/0` 等过大的范围也会放行回环地址、云元数据端点等敏感内网目标。
+
+### 配合 TUN 路由使用 Fake-IP DNS
+
+管理员可在**设置 → 安全 → Fake-IP DNS 例外**中选择服务器、填写精确域名，增删规则后保存。服务器选择器保存稳定 ID；删除全部规则并保存可清空例外。
+
+对于可信本地 Fake-IP/TUN 环境中的 SSE 和 Streamable HTTP 上游，管理员可以仅允许一个稳定服务器 ID 的精确域名访问 `198.18.0.0/15`，无需全局放行该网段：
+
+```json
+{
+  "systemConfig": {
+    "network": {
+      "fakeIpExceptions": [
+        { "serverId": "existing-server-uuid", "hostname": "mcp.example.com" }
+      ]
+    }
+  }
+}
+```
+
+使用 `GET /api/servers` 返回的现有服务器 `id`，而非显示名称。域名必须是小写 ASCII DNS 名称，不能包含协议、端口、通配符或末尾点；国际化域名使用 punycode。缺少 ID 时不会匹配。数据库模式通过仅管理员可用的 `PUT /api/system-config` 配置，请求体为 `{"network":{"fakeIpExceptions":[{"serverId":"existing-server-uuid","hostname":"mcp.example.com"}]}}`。空数组清空例外。更新任一网络列表都会保留另一列表，包括在设置页修改 CIDR。
+
+例外适用于通过指定服务器 MCP 传输 fetch 发出的请求，包括复用该 fetch 的 SDK OAuth 请求。初始 DNS、每个重定向目标和建连时的 DNS 均执行同一策略，所有解析结果必须通过检查；不会额外放行回环、私网和元数据地址。IP 字面量 URL、其他域名或其他服务器 ID 均不匹配。跳转到其他域名且解析为 Fake-IP 时，需要独立匹配的例外；公网地址继续遵守普通策略。已有全局 CIDR 白名单和管理员所有者豁免仍然生效；需要此窄范围边界时，应使用非管理员拥有的服务器且不配置宽泛 CIDR。移除例外影响后续请求与解析，不会中止已有流或连接。
+
+受保护连接使用直接 socket DNS 校验，绕过配置的 HTTP/HTTPS 代理。系统级 TUN 必须接管并路由这些连接，其 DNS 映射必须与 MCPHub 进程或容器内可见的 DNS 一致。仅放行合成网段并不能建立路由。MCPHub 信任本地 DNS/TUN 映射，无法确认合成地址背后的真实目标；仅对可信端点及可信代理环境配置例外。TLS 仍使用原始域名。本策略不启用显式 HTTP 代理路由，也不为 OpenAPI 请求、独立的 OAuth 发现/令牌/注册 fetch 或匿名 CIMD URL 增加例外，这些请求继续遵守原有 SSRF 策略。使用这些独立 fetch 的 OAuth 配置，仍可能需要端点返回真实 DNS 地址。
 
 ## 按需启动的工具快照
 
@@ -839,3 +895,10 @@ ls -la /path/to/server
 
 
 管理员可以在 **设置 → 系统设置 → 控制台名称** 中自定义名称，也可以在 `mcp_settings.json` 中设置 `systemConfig.dashboardName`（例如 `"dashboardName": "Team MCP"`）。名称会显示在侧栏、页头、登录页和浏览器标签中，首尾空格会被去除，长度上限为 100 个字符。保存空值可恢复默认名称。文件和数据库存储模式均支持持久化此设置。
+
+
+## 用户组共享
+
+管理员可在 **用户 → 编辑 → 用户组** 中用英文逗号分隔组名，也可通过 `PUT /api/users/:username` 提交 `userGroups: ["readers"]`。组名区分大小写，相同名称代表同一用户组；清空数组会移除该用户的所有成员关系。用户组独立于聚合服务器的 Group。
+
+将服务器设为 `visibility: "group"`，并配置 `sharedWithUserGroups: ["readers"]`，即可向该组所有成员授予使用权限。服务器与 Group 的共享界面均可选择用户组；共享 Group 路由不会自动授予其底层服务器权限。成员变更在下次认证请求时生效，包括现有用户级 key 和 OAuth 会话。共享不授予配置管理权限，工具 policy 仍可进一步收紧访问。

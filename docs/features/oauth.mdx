@@ -159,7 +159,9 @@ You can rely on auto-detection for most servers or declare OAuth settings explic
 1. **Initialization** – On startup MCPHub processes every server entry, discovers metadata, and registers the client if `dynamicRegistration.enabled` is true.
 2. **User Authorization** – Initiating a connection launches the system browser to the server’s authorize page with PKCE parameters.
 3. **Callback Handling** – The built-in route (`/oauth/callback`) verifies the `state`, completes the token exchange, and saves the tokens via the MCP SDK.
-4. **Token Lifecycle** – Access and refresh tokens are cached in memory, refreshed automatically, and written back to `mcp_settings.json`.
+4. **Token Lifecycle** – MCPHub persists `expires_in` as an absolute `accessTokenExpiresAt` timestamp. Before returning an expired token to the transport, it renews through the SDK and saves the rotated refresh token. Shared tokens use server settings; personal tokens remain in the user's encrypted binding. Expiry survives runtime recreation, and concurrent personal renewals for the same binding revision within one MCPHub process share one refresh.
+
+Tokens saved before expiry tracking, or issued without `expires_in`, retain HTTP 401-based SDK recovery; MCPHub cannot infer an opaque token's expiry. Reauthorize an existing personal connection to establish expiry tracking. Early revocation can still appear as an error inside a successful MCP tool response rather than an HTTP 401. MCPHub returns that error without automatically replaying the tool, because a retry could duplicate side effects. Reconnect through the dashboard for supported recovery; there is no separate personal refresh endpoint.
 
 ## Tips & Troubleshooting
 - Confirm that the redirect URI used during authorization exactly matches one of the `redirect_uris` registered with the authorization server.
@@ -200,3 +202,71 @@ MCP protected-resource discovery and the SDK's resource indicator validation sti
 The selected metadata is captured with pending PKCE/state for callback recovery; authorization, code exchange and refresh use the same configured authority. Callback `iss` validation remains enabled, including required `iss` when metadata declares `authorization_response_iss_parameter_supported: true`. HTTP token endpoints still require the separate administrator-controlled `allowInsecureTokenEndpoint` exception. Personal token encryption, refresh and user isolation are unchanged; changing the metadata invalidates personal bindings and requires reconnecting.
 
 This per-server setting is independent of MCPHub's downstream `systemConfig.oauthServer` and the legacy global `systemConfig.oauth` proxy. Neither global setting is required for this flow.
+
+
+## Private broker authorization relay
+
+Administrators can also enable this in the server form: select a personal OAuth identity, expand **OAuth Configuration → Advanced settings**, enable **Relay authorization through MCPHub**, and enter the allowed HTTPS origins and broker metadata JSON. Disabling the switch removes the relay configuration; changing to shared identity also disables it.
+
+For a private OAuth broker whose `/authorize` endpoint immediately redirects to an external identity provider, administrators can enable `oauth.authorizationRelay` on a personal-OAuth HTTP connector. Supply explicit broker metadata and an exact list of allowed HTTPS redirect origins:
+
+```json
+{
+  "type": "streamable-http",
+  "url": "http://broker.internal:3000/mcp",
+  "oauth": {
+    "identityMode": "personal",
+    "clientId": "${BROKER_CLIENT_ID}",
+    "clientSecret": "${BROKER_CLIENT_SECRET}",
+    "redirectUri": "https://hub.example.com/oauth/callback",
+    "allowInsecureTokenEndpoint": true,
+    "authorizationServerMetadata": {
+      "issuer": "http://broker.internal:3000",
+      "authorization_endpoint": "http://broker.internal:3000/authorize",
+      "token_endpoint": "http://broker.internal:3000/token",
+      "response_types_supported": ["code"],
+      "code_challenge_methods_supported": ["S256"]
+    },
+    "authorizationRelay": {
+      "allowedRedirectOrigins": ["https://login.microsoftonline.com"]
+    }
+  }
+}
+```
+
+Use the broker's actual issuer, endpoints, supported scopes and client-authentication metadata. Configure its callback allow-list for MCPHub's public callback. The HTTP token exception is needed only for an HTTP broker; credentials then travel over that private connection without TLS. Only administrators can create or edit a relay connector. Operator-owned file declarations without an owner are also trusted; a declared owner must remain an administrator.
+
+The dashboard returns a connector-specific MCPHub `/oauth/relay/<name>?state=…` URL instead of the private authorization URL. It uses the public callback's base path, including any installation prefix. MCPHub forwards the saved authorization request once per relay request, without browser cookies or authorization headers, and returns only an allowed external redirect. Token exchange and refresh continue through the broker; its issuer, resource, state and PKCE handling remain unchanged. Relay access requires an unexpired personal flow bound to the current connector declaration and user permissions. Disconnecting or completing a flow invalidates the relay link. Treat the link as a temporary credential and redact its query from reverse-proxy access logs.
+
+This is an opt-in authorization-entry relay, separate from the legacy global OAuth proxy and direct Microsoft Graph-token integration. It does not proxy HTML, cookies, relative internal redirects, broker callback pages or arbitrary URLs. A broker that requires the browser to revisit its private hostname needs a different deployment. The authorization endpoint must not contain a query; upstream responses have a 10-second timeout and bounded headers, their bodies are discarded, and only 302/303/307/308 redirects to listed HTTPS origins are accepted. Unconfigured connectors retain their existing behavior.
+
+Mocked tests cover independent users, callback recovery, code exchange, refresh and authenticated MCP requests. Live Microsoft compatibility remains unverified; test your application registration, broker mode, scopes and refresh lifecycle before production use.
+
+
+## Remembering Downstream Application Consent
+
+MCPHub's own OAuth authorization server displays a consent screen on every authorization by default. Operators can enable **Remember user consent** and edit **Consent lifetime (seconds)** under **Settings → OAuth Server**. The same settings are available in `systemConfig.oauthServer` (also accepted as an `oauthServer` object by `PUT /api/system-config`):
+
+```json
+{
+  "systemConfig": {
+    "oauthServer": {
+      "alwaysShowApprovalScreen": false,
+      "approvalLifetime": 1209600
+    }
+  }
+}
+```
+
+`approvalLifetime` is a fixed lifetime in seconds from explicit approval (default 14 days; accepted range 1–31536000). Reauthorization and refresh-token rotation do not extend it. Expiry requires confirmation on the next authorization request; existing access and refresh tokens retain their normal lifetimes. Setting `alwaysShowApprovalScreen` to `true` restores every-time confirmation without revoking existing access.
+
+Consent is specific to the current user credential version, client ID and metadata, exact redirect URI, and exact `resource` value (including its absence). Only requests whose effective scopes are a subset of previously approved scopes can skip the screen. Omitted scopes use the configured `allowedScopes`; changes that add permissions require confirmation. Public clients still need S256 PKCE, and every successful authorization issues a fresh authorization code. Clients that register a new client ID on reconnect must be approved again.
+
+The dashboard-authenticated management APIs expose only the current user's approvals:
+
+- `GET /api/oauth/approvals` returns `{ "success": true, "data": [...] }`; each entry includes `id`, `clientId`, `scopes`, `resource`, `redirectUri`, `approvedAt`, and `expiresAt`.
+- `DELETE /api/oauth/approvals/:approvalId` revokes all approvals and existing tokens for that entry's application and current user, including pending authorization codes. Another user's entry returns 404. MCP OAuth access tokens cannot authenticate these management APIs.
+
+Open the user menu at the bottom of the sidebar and choose **Authorized applications** to inspect your permissions, resource, callback URL, and consent dates. Choose **Revoke application** and confirm to remove all of that application's authorizations, pending codes, and tokens for your account. This page is available to every signed-in user; global OAuth settings retain their existing settings permission checks. Explicit consent is recorded even when every-time confirmation is enabled, so these grants can still be revoked. Skipping confirmation remains opt-in.
+
+In file mode, approvals live in `<settings-path>.approvals.json` with owner-only permissions; in database mode they live in `oauth_client_approvals`. Keep the sidecar with runtime backups. Approvals are excluded from configuration exports and declarative reconciliation. Switching from file to database storage requires fresh consent; approval-linked tokens without their grant fail closed. Expired records remain available for revoking still-live tokens and are removed when the user or client is deleted, or the application is revoked. Database replicas read grants directly so revocation applies on their next token use, including to tokens persisted concurrently with revocation. Run `pnpm db:setup` before upgrading replicas with `DB_SYNCHRONIZE=false`.

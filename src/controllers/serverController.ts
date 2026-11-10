@@ -1,7 +1,7 @@
 import { validateToolPolicies } from '../utils/toolPolicy.js';
 import { hasPersonalAuthentication } from '../utils/credentialTemplate.js';
 import { matchesNamePattern } from '../utils/namePattern.js';
-import { validateAllowedCidrs } from '../utils/ssrf.js';
+import { validateAllowedCidrs, validateFakeIpExceptions } from '../utils/ssrf.js';
 import {
   copyCredentialBindings,
   deleteCredentialBindings,
@@ -146,6 +146,20 @@ const loadAuthorizedServer = async (
   return server;
 };
 
+// Tool, prompt and resource settings change what is exposed, not how upstream
+// servers connect, so their handlers only broadcast. The unscoped
+// notifyToolChanged() would re-initialize every enabled server that is not
+// connected and re-spawn its stdio process. See #938 and #1426.
+const broadcastPromptSettingsChanged = (): void => {
+  broadcastToolListChanged();
+  broadcastPromptListChanged();
+};
+
+const broadcastResourceSettingsChanged = (): void => {
+  broadcastToolListChanged();
+  broadcastResourceListChanged();
+};
+
 const ensureNonAdminCanManageConfig = (
   req: Request,
   res: Response,
@@ -159,8 +173,9 @@ const ensureNonAdminCanManageConfig = (
   if (isPrivilegedServerConfig(config)) {
     res.status(403).json({
       success: false,
-      message:
-        config.oauth?.allowInsecureTokenEndpoint === true
+      message: config.oauth?.authorizationRelay
+        ? 'Only admins can create or modify servers using an OAuth authorization relay'
+        : config.oauth?.allowInsecureTokenEndpoint === true
           ? 'Only admins can create or modify servers allowing HTTP OAuth token endpoints'
           : config.passthroughHeaders?.length || config.openapi?.passthroughHeaders?.length
             ? 'Only admins can create or modify servers forwarding caller headers'
@@ -398,7 +413,11 @@ export const getServerShareCandidates = async (req: Request, res: Response): Pro
       .filter((username) => username !== effectiveOwner)
       .sort((left, right) => left.localeCompare(right));
 
-    res.json({ success: true, data: usernames });
+    res.json({
+      success: true,
+      data: usernames,
+      userGroups: [...new Set(users.flatMap((user) => user.userGroups ?? []))].sort(),
+    });
   } catch (error) {
     logger.error('Failed to get server share candidates:', error);
     res.status(500).json({
@@ -890,8 +909,9 @@ export const batchCreateServers = async (req: Request, res: Response): Promise<v
           results.push({
             name: serverName,
             success: false,
-            message:
-              normalizedConfig.oauth?.allowInsecureTokenEndpoint === true
+            message: normalizedConfig.oauth?.authorizationRelay
+              ? 'Only admins can create or modify servers using an OAuth authorization relay'
+              : normalizedConfig.oauth?.allowInsecureTokenEndpoint === true
                 ? 'Only admins can create or modify servers allowing HTTP OAuth token endpoints'
                 : normalizedConfig.passthroughHeaders?.length ||
                     normalizedConfig.openapi?.passthroughHeaders?.length
@@ -990,7 +1010,12 @@ export const deleteServer = async (req: Request, res: Response): Promise<void> =
 
     const result = await removeServer(existingServer.name);
     if (result.success) {
-      notifyToolChanged();
+      // removeServer already closed the server and dropped it from serverInfos.
+      // Only broadcast: a full re-init would reconnect every other server that
+      // is not connected (see #938).
+      broadcastToolListChanged();
+      broadcastPromptListChanged();
+      broadcastResourceListChanged();
       res.json({
         success: true,
         message: 'Server removed successfully',
@@ -1169,7 +1194,8 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
     }
 
     if (
-      ((existingServer.oauth?.allowInsecureTokenEndpoint === true ||
+      ((Boolean(existingServer.oauth?.authorizationRelay) ||
+        existingServer.oauth?.allowInsecureTokenEndpoint === true ||
         Boolean(
           existingServer.passthroughHeaders?.length ||
             existingServer.openapi?.passthroughHeaders?.length,
@@ -1327,6 +1353,7 @@ export const updateServer = async (req: Request, res: Response): Promise<void> =
         finalName,
         normalizedConfig.visibility ?? 'private',
         normalizedConfig.sharedWithUsers,
+        normalizedConfig.sharedWithUserGroups,
       );
       broadcastToolListChanged();
 
@@ -1728,7 +1755,7 @@ export const batchToggleTools = async (req: Request, res: Response): Promise<voi
         return;
       }
       if (liveServer?.config) liveServer.config = { ...liveServer.config, tools };
-      notifyToolChanged();
+      broadcastToolListChanged();
     }
     const data: BatchToggleToolsResponse = { matchedTools, enabled };
     res.json({ success: true, data });
@@ -1786,20 +1813,16 @@ export const toggleTool = async (req: Request, res: Response): Promise<void> => 
       return;
     }
 
-    // For an already-connected server, notifyToolChanged()'s full re-init pass
-    // takes the "already connected" shortcut and preserves the in-memory
-    // serverInfo verbatim (see registerAllTools) instead of applying the
-    // freshly-persisted tools config — so findToolOnServer's enabled check
-    // would keep seeing the pre-toggle state until the server reconnects for
-    // an unrelated reason. Patch the live config in place so the toggle takes
-    // effect immediately, without waiting for (or forcing) a reconnect.
+    // findToolOnServer's enabled check reads the in-memory serverInfo.config,
+    // which nothing reloads from settings while the server stays connected.
+    // Patch the live config in place so the toggle takes effect immediately,
+    // without waiting for (or forcing) a reconnect.
     const liveServer = getServerByName(serverName);
     if (liveServer?.config) {
       liveServer.config = { ...liveServer.config, tools };
     }
 
-    // Notify that tools have changed
-    notifyToolChanged();
+    broadcastToolListChanged();
 
     res.json({
       success: true,
@@ -1874,7 +1897,7 @@ export const updateToolDescription = async (req: Request, res: Response): Promis
     }
 
     // Notify that tools have changed
-    notifyToolChanged();
+    broadcastToolListChanged();
 
     syncToolEmbedding(serverName, toolName);
 
@@ -1975,7 +1998,7 @@ export const updateToolHiddenParams = async (req: Request, res: Response): Promi
       liveServer.config = { ...liveServer.config, tools };
     }
 
-    notifyToolChanged();
+    broadcastToolListChanged();
     syncToolEmbedding(serverName, toolName);
 
     res.json({
@@ -2027,7 +2050,7 @@ export const resetToolDescription = async (req: Request, res: Response): Promise
       return;
     }
 
-    notifyToolChanged();
+    broadcastToolListChanged();
     syncToolEmbedding(serverName, toolName);
 
     const defaultDescription =
@@ -2074,6 +2097,18 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
       network,
       toolPolicies,
     } = req.body;
+    if (
+      oauthServer?.approvalLifetime !== undefined &&
+      (!Number.isSafeInteger(oauthServer.approvalLifetime) ||
+        oauthServer.approvalLifetime <= 0 ||
+        oauthServer.approvalLifetime > 31536000)
+    ) {
+      res.status(400).json({
+        success: false,
+        message: 'approvalLifetime must be between 1 and 31536000 seconds',
+      });
+      return;
+    }
     if (toolPolicies !== undefined) {
       try {
         validateToolPolicies(toolPolicies);
@@ -2094,11 +2129,28 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         });
       return;
     }
-    const hasNetworkUpdate = network !== undefined;
-    if (hasNetworkUpdate && (!network || !validateAllowedCidrs(network.allowedCidrs))) {
+    if (
+      routing?.allowAuthorizationPassthrough !== undefined &&
+      typeof routing.allowAuthorizationPassthrough !== 'boolean'
+    ) {
       res.status(400).json({
         success: false,
-        message: 'network.allowedCidrs must be an array of valid IPv4 or IPv6 CIDRs',
+        message: 'routing.allowAuthorizationPassthrough must be a boolean',
+      });
+      return;
+    }
+    const hasNetworkUpdate = network !== undefined;
+    if (
+      hasNetworkUpdate &&
+      (!network ||
+        (network.allowedCidrs === undefined && network.fakeIpExceptions === undefined) ||
+        (network.allowedCidrs !== undefined && !validateAllowedCidrs(network.allowedCidrs)) ||
+        (network.fakeIpExceptions !== undefined &&
+          !validateFakeIpExceptions(network.fakeIpExceptions)))
+    ) {
+      res.status(400).json({
+        success: false,
+        message: 'Invalid network allowedCidrs or fakeIpExceptions',
       });
       return;
     }
@@ -2111,6 +2163,7 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
         typeof routing.enableBearerAuth === 'boolean' ||
         typeof routing.bearerAuthKey === 'string' ||
         typeof routing.bearerAuthHeaderName === 'string' ||
+        typeof routing.allowAuthorizationPassthrough === 'boolean' ||
         typeof routing.jsonBodyLimit === 'string' ||
         typeof routing.skipAuth === 'boolean');
 
@@ -2171,7 +2224,9 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
 
     const hasOAuthServerUpdate =
       oauthServer &&
-      (typeof oauthServer.enabled === 'boolean' ||
+      (typeof oauthServer.alwaysShowApprovalScreen === 'boolean' ||
+        typeof oauthServer.approvalLifetime === 'number' ||
+        typeof oauthServer.enabled === 'boolean' ||
         typeof oauthServer.accessTokenLifetime === 'number' ||
         typeof oauthServer.refreshTokenLifetime === 'number' ||
         typeof oauthServer.authorizationCodeLifetime === 'number' ||
@@ -2383,6 +2438,10 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
 
       if (typeof routing.bearerAuthHeaderName === 'string') {
         systemConfig.routing.bearerAuthHeaderName = routing.bearerAuthHeaderName.trim();
+      }
+
+      if (typeof routing.allowAuthorizationPassthrough === 'boolean') {
+        systemConfig.routing.allowAuthorizationPassthrough = routing.allowAuthorizationPassthrough;
       }
 
       if (typeof routing.jsonBodyLimit === 'string') {
@@ -2703,6 +2762,12 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
 
     if (oauthServer) {
       const target = systemConfig.oauthServer;
+      if (typeof oauthServer.alwaysShowApprovalScreen === 'boolean') {
+        target.alwaysShowApprovalScreen = oauthServer.alwaysShowApprovalScreen;
+      }
+      if (typeof oauthServer.approvalLifetime === 'number') {
+        target.approvalLifetime = oauthServer.approvalLifetime;
+      }
       if (typeof oauthServer.enabled === 'boolean') {
         target.enabled = oauthServer.enabled;
       }
@@ -2871,7 +2936,15 @@ export const updateSystemConfig = async (req: Request, res: Response): Promise<v
     }
 
     if (hasNetworkUpdate) {
-      systemConfig.network = { allowedCidrs: [...new Set<string>(network.allowedCidrs)] };
+      systemConfig.network = {
+        ...systemConfig.network,
+        ...(network.allowedCidrs !== undefined
+          ? { allowedCidrs: [...new Set<string>(network.allowedCidrs)] }
+          : {}),
+        ...(network.fakeIpExceptions !== undefined
+          ? { fakeIpExceptions: network.fakeIpExceptions }
+          : {}),
+      };
     }
 
     if (toolPolicies !== undefined) systemConfig.toolPolicies = toolPolicies;
@@ -2961,8 +3034,8 @@ export const togglePrompt = async (req: Request, res: Response): Promise<void> =
       return;
     }
 
-    // Notify that tools have changed (as prompts are part of the tool listing)
-    notifyToolChanged();
+    // Notify that prompts have changed
+    broadcastPromptSettingsChanged();
 
     res.json({
       success: true,
@@ -3031,8 +3104,8 @@ export const updatePromptDescription = async (req: Request, res: Response): Prom
       return;
     }
 
-    // Notify that tools have changed (as prompts are part of the tool listing)
-    notifyToolChanged();
+    // Notify that prompts have changed
+    broadcastPromptSettingsChanged();
 
     res.json({
       success: true,
@@ -3081,7 +3154,7 @@ export const resetPromptDescription = async (req: Request, res: Response): Promi
       return;
     }
 
-    notifyToolChanged();
+    broadcastPromptSettingsChanged();
 
     const defaultDescription =
       getServerByName(serverName)?.prompts.find((prompt) => prompt.name === promptName)
@@ -3155,7 +3228,7 @@ export const toggleResource = async (req: Request, res: Response): Promise<void>
     }
 
     // Notify that tools/resources metadata has changed
-    notifyToolChanged();
+    broadcastResourceSettingsChanged();
 
     res.json({
       success: true,
@@ -3225,7 +3298,7 @@ export const updateResourceDescription = async (req: Request, res: Response): Pr
     }
 
     // Notify that tools/resources metadata has changed
-    notifyToolChanged();
+    broadcastResourceSettingsChanged();
 
     res.json({
       success: true,
@@ -3274,7 +3347,7 @@ export const resetResourceDescription = async (req: Request, res: Response): Pro
       return;
     }
 
-    notifyToolChanged();
+    broadcastResourceSettingsChanged();
 
     const defaultDescription =
       getServerByName(serverName)?.resources.find((resource) => resource.uri === resourceUri)

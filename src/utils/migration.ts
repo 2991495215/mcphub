@@ -1,4 +1,5 @@
 import { legacyServerId } from './serverIdentity.js';
+import { isReplicaMode } from './replicaMode.js';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { toStoredToken } from './bearerKeyToken.js';
@@ -115,6 +116,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             isAdmin: user.isAdmin || false,
             email: user.email ?? null,
             ssoUserId: (user as any).ssoUserId ?? null,
+            userGroups: user.userGroups,
           });
           logger.log(`  - Created user: ${user.username}`);
         } else {
@@ -156,6 +158,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             enabled: config.enabled !== undefined ? config.enabled : true,
             owner: config.owner,
             visibility: config.visibility ?? 'private',
+            sharedWithUserGroups: config.sharedWithUserGroups,
             sharedWithUsers: config.sharedWithUsers,
             enableKeepAlive: config.enableKeepAlive,
             protocolNegotiation: config.protocolNegotiation,
@@ -190,6 +193,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             servers: Array.isArray(group.servers) ? group.servers : [],
             owner: group.owner,
             visibility: group.visibility,
+            sharedWithUserGroups: group.sharedWithUserGroups,
             sharedWithUsers: group.sharedWithUsers,
           });
           logger.log(`  - Created group: ${group.name}`);
@@ -241,6 +245,8 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
           accessType: key.accessType,
           allowedGroups: key.allowedGroups ?? [],
           allowedServers: key.allowedServers ?? [],
+          excludedGroups: key.excludedGroups ?? [],
+          excludedServers: key.excludedServers ?? [],
         } as any);
         logger.log(`  - Migrated bearer key: ${key.name} (${key.id ?? 'no-id'})`);
       }
@@ -330,6 +336,7 @@ export async function migrateToDatabase(seedServersAndGroups = true): Promise<bo
             clientId: token.clientId,
             username: token.username,
             sessionVersion: token.sessionVersion,
+            approvalId: token.approvalId,
           });
           logger.log(`  - Created OAuth token for client: ${token.clientId}`);
         } else {
@@ -412,6 +419,9 @@ export async function initializeDatabaseMode(): Promise<boolean> {
     const systemConfigRepo = new SystemConfigRepository();
 
     const userCount = await userRepo.count();
+
+    if (isReplicaMode() && userCount === 0)
+      throw new Error('Replica database is not seeded; run db:setup before starting replicas');
 
     if (userCount === 0) {
       logger.log('No users found in database, running migration...');

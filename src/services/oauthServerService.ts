@@ -1,3 +1,8 @@
+import {
+  isApprovalGrantValid,
+  rememberApproval,
+  resolveConsentScopes,
+} from './oauthApprovalService.js';
 import { getUserSessionVersion, resolveUserSession } from '../utils/userSession.js';
 import OAuth2Server from '@node-oauth/oauth2-server';
 import { Request as ExpressRequest, Response as ExpressResponse } from 'express';
@@ -15,8 +20,9 @@ import {
 import crypto from 'crypto';
 import { safeCompare } from '../utils/safeCompare.js';
 import { cloneDefaultOAuthServerConfig } from '../constants/oauthServerDefaults.js';
-import { resolveCimdClient } from './cimdClientService.js';
+import { findOAuthClientIncludingCimd, resolveCimdClient } from './cimdClientService.js';
 import { logger } from '../utils/logger.js';
+import type { SystemConfig } from '../types/index.js';
 
 const { Request, Response } = OAuth2Server;
 
@@ -98,13 +104,32 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
     if (!currentUser) throw new OAuth2Server.InvalidGrantError('User no longer exists');
     const sessionVersion = getUserSessionVersion(currentUser);
 
-    const authCode = saveAuthorizationCode(
+    let approvalId = user.approvalId as string | undefined;
+    if (
+      approvalId &&
+      !(await isApprovalGrantValid({ ...user, username: user.username }, client.id))
+    ) {
+      throw new OAuth2Server.InvalidGrantError('Consent has been revoked');
+    }
+    if (!approvalId && user.approvalContext) {
+      const consentClient = await findOAuthClientIncludingCimd(client.id);
+      if (!consentClient) throw new OAuth2Server.InvalidClientError('Client not found');
+      approvalId = await rememberApproval(
+        { ...user, username: user.username, sessionVersion },
+        consentClient,
+        Array.isArray(code.scope) ? code.scope : (code.scope || '').split(' ').filter(Boolean),
+        oauthConfig?.approvalLifetime ?? 1209600,
+      );
+    }
+
+    const authCode = await saveAuthorizationCode(
       {
         redirectUri: code.redirectUri,
         scope: scopeString,
         clientId: client.id,
         username: user.username,
         sessionVersion,
+        approvalId,
         codeChallenge: code.codeChallenge,
         codeChallengeMethod: code.codeChallengeMethod,
       },
@@ -129,8 +154,12 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
    * Get authorization code
    */
   getAuthorizationCode: async (authorizationCode: string) => {
-    const code = getAuthorizationCode(authorizationCode);
-    if (!code || !(await resolveUserSession(code))) {
+    const code = await getAuthorizationCode(authorizationCode);
+    if (
+      !code ||
+      !(await resolveUserSession(code)) ||
+      !(await isApprovalGrantValid(code, code.clientId))
+    ) {
       return false;
     }
 
@@ -156,6 +185,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
       user: {
         username: code.username,
         sessionVersion: code.sessionVersion,
+        approvalId: code.approvalId,
       },
       codeChallenge: code.codeChallenge,
       codeChallengeMethod: code.codeChallengeMethod,
@@ -166,8 +196,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
    * Revoke authorization code
    */
   revokeAuthorizationCode: async (code: OAuth2Server.AuthorizationCode) => {
-    revokeAuthorizationCode(code.authorizationCode);
-    return true;
+    return await revokeAuthorizationCode(code.authorizationCode);
   },
 
   /**
@@ -186,7 +215,10 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
 
     const scopeString = Array.isArray(token.scope) ? token.scope.join(' ') : token.scope;
 
-    if (!(await resolveUserSession(user))) {
+    if (
+      !(await resolveUserSession(user)) ||
+      !(await isApprovalGrantValid({ ...user, username: user.username }, client.id))
+    ) {
       throw new OAuth2Server.InvalidGrantError('User session is no longer valid');
     }
 
@@ -196,6 +228,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
         clientId: client.id,
         username: user.username,
         sessionVersion: user.sessionVersion,
+        approvalId: user.approvalId,
       },
       accessTokenLifetime,
       refreshTokenLifetime,
@@ -246,6 +279,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
       user: {
         username: token.username,
         sessionVersion: token.sessionVersion,
+        approvalId: token.approvalId,
       },
     };
   },
@@ -280,6 +314,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
       user: {
         username: token.username,
         sessionVersion: token.sessionVersion,
+        approvalId: token.approvalId,
       },
     };
   },
@@ -320,11 +355,7 @@ const oauthModel: OAuth2Server.AuthorizationCodeModel & OAuth2Server.RefreshToke
     const oauthConfig = systemConfig?.oauthServer;
     const allowedScopes = oauthConfig?.allowedScopes || ['read', 'write'];
 
-    if (!scope || scope.length === 0) {
-      return allowedScopes;
-    }
-
-    const validScopes = scope.filter((s) => allowedScopes.includes(s));
+    const validScopes = resolveConsentScopes(scope?.join(' '), allowedScopes);
 
     return validScopes.length > 0 ? validScopes : false;
   },
@@ -336,12 +367,12 @@ let oauth: OAuth2Server | null = null;
 /**
  * Initialize OAuth server
  */
-export const initOAuthServer = async (): Promise<void> => {
+export const initOAuthServer = async (configuration?: SystemConfig | null): Promise<void> => {
   // Reset to ensure clean state on re-initialization
   oauth = null;
 
   const systemConfigDao = getSystemConfigDao();
-  const systemConfig = await systemConfigDao.get();
+  const systemConfig = configuration === undefined ? await systemConfigDao.get() : configuration;
   const storedConfig = systemConfig?.oauthServer;
   // Merge stored config with defaults so partial configs still inherit all default values
   const oauthConfig = { ...cloneDefaultOAuthServerConfig(), ...storedConfig };

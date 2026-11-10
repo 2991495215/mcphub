@@ -1,6 +1,10 @@
+import { listMyOAuthApprovals, revokeMyOAuthApproval } from '../controllers/oauthApprovalController.js';
+import { handleOAuthRelay } from '../controllers/oauthRelayController.js';
 import { metrics } from '../controllers/metricsController.js';
 import { managePersonalOAuth } from '../controllers/personalOAuthController.js';
 import {
+  copyMyCredential,
+  copyUserCredential,
   listMyCredentials,
   updateMyCredential,
   listUserCredentials,
@@ -128,7 +132,10 @@ import {
   readResource,
 } from '../controllers/builtinResourceController.js';
 import { uploadMcpbFile, uploadMiddleware } from '../controllers/mcpbController.js';
-import { healthCheck } from '../controllers/healthController.js';
+import { healthCheck, livenessCheck, readinessCheck } from '../controllers/healthController.js';
+import { replicaConfiguration } from '../middlewares/replicaConfig.js';
+import { replicaStatus } from '../services/replicaService.js';
+import { isReplicaMode } from '../utils/replicaMode.js';
 import { getBetterAuthUser } from '../controllers/betterAuthController.js';
 import {
   getOpenAPISpec,
@@ -223,6 +230,8 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
 
   // Health check endpoint (no auth required, accessible at /health)
   app.get('/health', healthCheck);
+  app.get('/livez', livenessCheck);
+  app.get('/readyz', readinessCheck);
   app.get('/metrics', metrics);
 
   // Hosted data-plane webhook ingress. HMAC-authenticated by INTERNAL_API_SECRET.
@@ -234,6 +243,7 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   );
 
   // OAuth callback endpoint (no auth required, public callback URL)
+  app.get('/oauth/relay/:name', mcpConnectionRateLimiter, handleOAuthRelay);
   app.get('/oauth/callback', mcpConnectionRateLimiter, handleOAuthCallback);
 
   // OAuth Authorization Server endpoints (no auth required for OAuth flow)
@@ -268,6 +278,11 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   app.delete('/oauth/register/:clientId', mcpConnectionRateLimiter, deleteClientRegistration); // Delete client registration
 
   authenticatedRouter.use(authenticatedRouteRateLimiter);
+  authenticatedRouter.get('/cluster', requireAdminMiddleware, (_req, res) => {
+    if (!isReplicaMode()) { res.sendStatus(404); return; }
+    res.json({ success: true, data: replicaStatus() });
+  });
+  authenticatedRouter.use(replicaConfiguration);
   // `authenticatedRouter` is mounted at the end of this function, after the public
   // routes below have been registered on `router`. The order matters: the limiter
   // above is a path-less `use`, so it runs for every request that reaches the
@@ -280,9 +295,13 @@ export const initRoutes = async (app: express.Application): Promise<void> => {
   authenticatedRouter.get('/users/:username/credentials', listUserCredentials);
   authenticatedRouter.put('/users/:username/credentials/:name', updateUserCredential);
   authenticatedRouter.delete('/users/:username/credentials/:name', updateUserCredential);
+  authenticatedRouter.post('/users/:username/credentials/:name/copy', copyUserCredential);
+  authenticatedRouter.post('/credentials/:name/copy', copyMyCredential);
   authenticatedRouter.get('/credentials', listMyCredentials);
   authenticatedRouter.put('/credentials/:name', updateMyCredential);
   authenticatedRouter.delete('/credentials/:name', updateMyCredential);
+  authenticatedRouter.get('/oauth/approvals', listMyOAuthApprovals);
+  authenticatedRouter.delete('/oauth/approvals/:approvalId', revokeMyOAuthApproval);
   authenticatedRouter.get('/servers', getAllServers);
   authenticatedRouter.get('/servers/:name/share-candidates', getServerShareCandidates);
   authenticatedRouter.get('/servers/:name', getServerConfig);

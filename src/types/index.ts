@@ -1,3 +1,4 @@
+import type { FakeIpException } from './network.js';
 import type { ToolPolicyRule, PolicyDecision } from './toolPolicy.js';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import {
@@ -24,6 +25,7 @@ export interface CapabilityCacheStatus {
 
 // User interface
 export interface IUser {
+  userGroups?: string[];
   username: string;
   password: string;
   isAdmin?: boolean;
@@ -34,6 +36,7 @@ export interface IUser {
 // Group interface for server grouping
 export interface IGroup {
   visibility?: 'private' | 'group' | 'public';
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   id: string; // Unique UUID for the group
   name: string; // Display name of the group
@@ -247,6 +250,7 @@ export interface ForwardAuthJwksConfig {
   issuer?: string; // Expected `iss` claim; tokens with this issuer are verified and never fall back
   audience?: string | string[]; // Accepted `aud` claim value(s)
   algorithms?: string[]; // Allowed asymmetric algorithms (default: RS256, ES256)
+  tokenHeader?: string; // Header carrying the JWT, raw or as `Bearer <jwt>` (default: the bearer auth header)
 }
 
 export interface ForwardAuthConfig {
@@ -279,6 +283,7 @@ export interface SystemConfig {
   toolPolicies?: ToolPolicyRule[];
   network?: {
     allowedCidrs?: string[]; // Admin-managed ranges reachable by non-admin-owned upstreams.
+    fakeIpExceptions?: FakeIpException[];
   };
   routing?: {
     enableGlobalRoute?: boolean; // Controls whether the /sse endpoint without group is enabled
@@ -286,6 +291,7 @@ export interface SystemConfig {
     enableBearerAuth?: boolean; // Controls whether MCP endpoints require bearer authentication
     bearerAuthKey?: string; // Legacy bearer auth key (used for one-time migration)
     bearerAuthHeaderName?: string; // Header name used to receive bearer credentials for MCP/API requests (default: 'Authorization')
+    allowAuthorizationPassthrough?: boolean; // Admin opt-in; requires a separate MCPHub auth header.
     jsonBodyLimit?: string; // JSON request body size limit used by Express parser (default: '1mb'), including OpenAPI schema uploads
     skipAuth?: boolean; // Controls whether the dashboard requires login
   };
@@ -357,6 +363,19 @@ export interface IOAuthClient {
   };
 }
 
+export interface OAuthClientApproval {
+  id: string;
+  username: string;
+  sessionVersion: string;
+  clientId: string;
+  clientFingerprint: string;
+  redirectUri: string;
+  resource: string;
+  scopes: string[];
+  approvedAt: string;
+  expiresAt: string;
+}
+
 // OAuth Authorization Code (for MCPHub's authorization server)
 export interface IOAuthAuthorizationCode {
   code: string; // Authorization code
@@ -364,6 +383,7 @@ export interface IOAuthAuthorizationCode {
   redirectUri: string; // Redirect URI used in the authorization request
   scope?: string; // Granted scopes
   clientId: string; // Client ID
+  approvalId?: string; // Revocable consent grant associated with this authorization
   sessionVersion?: string; // Credential version at authorization
   username: string; // User who authorized
   codeChallenge?: string; // PKCE code challenge
@@ -378,12 +398,15 @@ export interface IOAuthToken {
   refreshTokenExpiresAt?: Date; // Refresh token expiration
   scope?: string; // Granted scopes
   clientId: string; // Client ID
+  approvalId?: string; // Preserved through refresh-token rotation
   sessionVersion?: string; // Credential version at issuance
   username: string; // Username
 }
 
 // OAuth Server Configuration
 export interface OAuthServerConfig {
+  alwaysShowApprovalScreen?: boolean; // Default true; false enables remembered consent
+  approvalLifetime?: number; // Fixed consent lifetime in seconds (default 1209600)
   enabled?: boolean; // Enable/disable OAuth authorization server
   accessTokenLifetime?: number; // Access token lifetime in seconds (default: 3600)
   refreshTokenLifetime?: number; // Refresh token lifetime in seconds (default: 1209600 = 14 days)
@@ -407,7 +430,7 @@ export interface OAuthServerConfig {
 }
 
 // Bearer authentication key configuration
-export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom';
+export type BearerKeyAccessType = 'all' | 'groups' | 'servers' | 'custom' | 'exclude';
 export type BearerKeyKind = 'system' | 'user';
 
 export interface BearerKey {
@@ -422,6 +445,8 @@ export interface BearerKey {
   accessType: BearerKeyAccessType; // Access scope type
   allowedGroups?: string[]; // Allowed group names when accessType === 'groups' or 'custom'
   allowedServers?: string[]; // Allowed server names when accessType === 'servers' or 'custom'
+  excludedGroups?: string[]; // Excluded group names when accessType === 'exclude' (system keys only)
+  excludedServers?: string[]; // Excluded server names when accessType === 'exclude' (system keys only)
 }
 
 // Represents the settings for MCP servers
@@ -487,9 +512,10 @@ export interface ServerConfig {
   // Per-server visibility for non-admin users.
   //   'private' — only the owner (or admins) can see this server. Default.
   //   'public'  — every authenticated user can see this server.
-  //   'group'   — explicitly selected users can see this server.
+  //   'group'   — selected users and user-group members can see this server.
   // See issues #817 and #1037.
   visibility?: ServerVisibility;
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[]; // Local MCPHub usernames allowed when visibility is 'group'.
   protocolNegotiation?: 'auto' | 'legacy'; // Streamable HTTP defaults to auto; other transports remain legacy.
   enableKeepAlive?: boolean; // Enable remote health checks; disconnected remote servers always retry
@@ -523,6 +549,7 @@ export interface ServerConfig {
     redirectUri?: string; // Preferred redirect URI for authorization requests and registration
     scopes?: string[]; // Required OAuth scopes
     accessToken?: string; // Pre-obtained access token (if available)
+    accessTokenExpiresAt?: number; // Absolute access token expiry in milliseconds
     refreshToken?: string; // Refresh token for renewing access
 
     // Dynamic client registration (RFC7591)
@@ -555,6 +582,7 @@ export interface ServerConfig {
 
     // Explicit authorization-server metadata replaces SDK discovery for this upstream.
     authorizationServerMetadata?: NonNullable<OAuthDiscoveryState['authorizationServerMetadata']>;
+    authorizationRelay?: { allowedRedirectOrigins: string[] };
     // Authorization endpoint for user authorization (for authorization code flow)
     authorizationEndpoint?: string;
     // Token endpoint for exchanging authorization codes for tokens
@@ -648,6 +676,7 @@ export interface ServerInfo {
   instructions?: string; // Upstream server instructions reported during MCP initialization
   owner?: string; // Owner of the server, defaults to 'admin' user
   visibility?: ServerVisibility; // Carried over from ServerConfig so dataService.filterData can apply #817 visibility rules at runtime.
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[]; // Carried over for restricted user-sharing authorization.
   status: 'connected' | 'connecting' | 'disconnected' | 'oauth_required'; // Current connection status
   error: string | null; // Error message if any
@@ -785,6 +814,7 @@ export interface BatchCreateServersResponse {
 // Request payload for adding a new group
 export interface AddGroupRequest {
   visibility?: IGroup['visibility'];
+  sharedWithUserGroups?: string[];
   sharedWithUsers?: string[];
   name: string; // Name of the group to add
   description?: string; // Optional description of the group

@@ -21,6 +21,7 @@ import { Server as McpServer } from '@modelcontextprotocol/server';
 import request from 'supertest';
 import {
   getServerDao,
+  getUserDao,
   getCredentialBindingDao,
   getSystemConfigDao,
   getGroupDao,
@@ -34,6 +35,8 @@ import {
   userContextMiddleware,
 } from '../../src/middlewares/userContext.js';
 import {
+  copyMyCredential,
+  copyUserCredential,
   listUserCredentials,
   updateUserCredential,
   listMyCredentials,
@@ -52,6 +55,7 @@ import {
   cleanupAllServers,
   getServersInfo,
   getServerByName,
+  updateServerInfoVisibility,
   removeServer,
   getServerConnectionStats,
   handleCallToolRequest,
@@ -175,6 +179,8 @@ beforeAll(async () => {
   app.get('/api/users/:username/credentials', listUserCredentials);
   app.put('/api/users/:username/credentials/:name', updateUserCredential);
   app.delete('/api/users/:username/credentials/:name', updateUserCredential);
+  app.post('/api/credentials/:name/copy', copyMyCredential);
+  app.post('/api/users/:username/credentials/:name/copy', copyUserCredential);
   app.get('/api/credentials', listMyCredentials);
   app.put('/api/credentials/:name', updateMyCredential);
   app.delete('/api/credentials/:name', updateMyCredential);
@@ -547,7 +553,7 @@ test('args credentials reach the child literally, isolate users, and redact fail
   }
 });
 
-test('dashboard bindings are write-only, self-scoped, and preserve the shared safe view', async () => {
+test('dashboard bindings return self-scoped masked previews and preserve the shared safe view', async () => {
   expect(getServerConnectionStats()).toEqual({ total: 0, connected: 0, disconnected: 0 });
   expect((await request(app).get('/api/credentials')).status).toBe(401);
   expect((await bind(alice, 'alice-sentinel')).status).toBe(200);
@@ -555,9 +561,11 @@ test('dashboard bindings are write-only, self-scoped, and preserve the shared sa
     .get('/api/credentials')
     .set('x-auth-token', apiToken(alice));
   expect(aliceStatus.body.data[0].configured).toBe(true);
+  expect(aliceStatus.body.data[0].valuePreviews).toEqual({ 'env.PERSONAL_KEY': '••••inel' });
   expect(JSON.stringify(aliceStatus.body)).not.toContain('alice-sentinel');
   const bobStatus = await request(app).get('/api/credentials').set('x-auth-token', apiToken(bob));
   expect(bobStatus.body.data[0].configured).toBe(false);
+  expect(bobStatus.body.data[0].valuePreviews).toEqual({});
   const config = await request(app).get('/api/servers/shared').set('x-auth-token', apiToken(alice));
   expect(config.body.data.config.configRestricted).toBe(true);
   expect(config.body.data.config.credentialTemplate).toEqual([
@@ -574,7 +582,7 @@ test('dashboard bindings are write-only, self-scoped, and preserve the shared sa
   ).not.toBe(200);
 });
 
-test('admins provision write-only target bindings with live isolation and explicit authentication', async () => {
+test('admins receive masked target previews while preserving isolation and authentication', async () => {
   const endpoint = `/api/users/${encodeURIComponent(alice)}/credentials`;
   const values = { 'env.PERSONAL_KEY': 'admin-provisioned-sentinel' };
   await bind(bob, 'bob-admin-test');
@@ -599,6 +607,7 @@ test('admins provision write-only target bindings with live isolation and explic
     configured: true,
     configuredSlots: ['env.PERSONAL_KEY'],
     updatedAt: expect.any(String),
+    valuePreviews: { 'env.PERSONAL_KEY': '••••inel' },
   });
   expect(JSON.stringify(status.body)).not.toContain('admin-provisioned-sentinel');
   expect(JSON.stringify(status.body)).not.toContain('encryptedValues');
@@ -1707,4 +1716,131 @@ test('on-demand personal snapshots restore isolated tools without spawning and r
   } finally {
     await removeServer(name);
   }
+});
+
+
+test('user-group membership grants server and group use, and removal revokes an existing user-key session', async () => {
+  const userDao = getUserDao();
+  const serverDao = getServerDao();
+  const original = await serverDao.findById('shared');
+  const originalUser = await userDao.findByUsername(alice);
+  const group = await getGroupDao().create({
+    name: 'user-membership-team',
+    owner: 'admin',
+    visibility: 'group',
+    sharedWithUserGroups: ['readers'],
+    servers: ['shared'],
+  });
+  const newClients: Client[] = [];
+  try {
+    await userDao.update(alice, { userGroups: ['readers'] });
+    await serverDao.update('shared', {
+      visibility: 'group',
+      sharedWithUsers: [],
+      sharedWithUserGroups: ['readers'],
+    });
+    updateServerInfoVisibility('shared', 'group', [], ['readers']);
+    await bind(alice, 'group-member-credential');
+    const client = await connect(alice, group.name);
+    newClients.push(client);
+    const toolName = (await client.listTools()).tools[0].name;
+    expect(parseIdentity(await client.callTool({ name: toolName })).credential).toBe(
+      'group-member-credential',
+    );
+    const direct = await connect(alice, 'shared');
+    newClients.push(direct);
+    expect((await direct.listTools()).tools).toHaveLength(1);
+    await userDao.update(alice, { userGroups: [] });
+    await expect(client.listTools()).rejects.toThrow(/Group access denied/);
+    await expect(client.callTool({ name: toolName })).rejects.toThrow(/Group access denied/);
+    expect((await direct.listTools()).tools).toHaveLength(0);
+    const denied = await direct.callTool({ name: toolName });
+    expect(denied.isError).toBe(true);
+  } finally {
+    await userDao.update(alice, { userGroups: ['readers'] });
+    for (const client of newClients) {
+      await client.close();
+      clients.splice(clients.indexOf(client), 1);
+    }
+    await userDao.update(alice, { userGroups: originalUser?.userGroups ?? [] });
+    await serverDao.update('shared', {
+      visibility: original!.visibility,
+      sharedWithUsers: original!.sharedWithUsers,
+      sharedWithUserGroups: original!.sharedWithUserGroups,
+    });
+    updateServerInfoVisibility(
+      'shared',
+      original!.visibility,
+      original!.sharedWithUsers,
+      original!.sharedWithUserGroups,
+    );
+    await getGroupDao().delete(group.id);
+  }
+});
+
+test('credential copy API scopes both endpoints to one authorized target user', async () => {
+  const source = (await getServerDao().findById('shared'))!;
+  await getServerDao().create({
+    ...source,
+    name: 'copy-target',
+    owner: 'admin',
+    visibility: 'public',
+  });
+  await getServerDao().create({
+    ...source,
+    name: 'copy-private',
+    owner: 'admin',
+    visibility: 'private',
+  });
+  await bind(alice, 'alice-copy-sentinel');
+  await bind(bob, 'bob-copy-sentinel');
+  const copy = (target: string, body: unknown, username = alice) =>
+    request(app)
+      .post(`/api/credentials/${target}/copy`)
+      .set('x-auth-token', apiToken(username))
+      .send(body);
+  expect((await copy('copy-target', { sourceServer: 'shared', username: bob })).status).toBe(200);
+  const { resolveCredentialBinding } = await import(
+    '../../src/services/credentialBindingService.js'
+  );
+  expect(
+    (await resolveCredentialBinding('copy-target', alice, source)).config.env?.PERSONAL_KEY,
+  ).toBe('alice-copy-sentinel');
+  expect(await getCredentialBindingDao().get('copy-target', bob)).toBeNull();
+  const client = await connect(alice);
+  const toolName = `shared${getNameSeparator()}identity`;
+  expect(parseIdentity(await client.callTool({ name: toolName })).credential).toBe('alice-copy-sentinel');
+  await request(app).put('/api/credentials/copy-target')
+    .set('x-auth-token', apiToken(alice))
+    .send({ values: { 'env.PERSONAL_KEY': 'copied-runtime-sentinel' } });
+  expect((await copy('shared', { sourceServer: 'copy-target', overwrite: true })).status).toBe(200);
+  expect(parseIdentity(await client.callTool({ name: toolName })).credential).toBe('copied-runtime-sentinel');
+
+  expect((await copy('copy-target', { sourceServer: 'shared' })).status).toBe(400);
+  expect((await copy('copy-target', { sourceServer: 'shared', overwrite: 'true' })).status).toBe(
+    400,
+  );
+  expect(
+    (await copy('copy-target', { sourceServer: 'copy-private', overwrite: true })).status,
+  ).toBe(404);
+  expect((await copy('copy-private', { sourceServer: 'shared' })).status).toBe(404);
+  expect(
+    (await request(app).post('/api/credentials/copy-target/copy').send({ sourceServer: 'shared' }))
+      .status,
+  ).toBe(401);
+  const managed = (actor: string) =>
+    request(app)
+      .post(`/api/users/${encodeURIComponent(bob)}/credentials/copy-target/copy`)
+      .set('x-auth-token', apiToken(actor))
+      .send({ sourceServer: 'shared' });
+  expect((await managed(alice)).status).toBe(403);
+  const response = await managed('admin');
+  expect(response.status).toBe(200);
+  expect(response.body).toEqual({ success: true });
+  expect(
+    (await resolveCredentialBinding('copy-target', bob, source)).config.env?.PERSONAL_KEY,
+  ).toBe('bob-copy-sentinel');
+  await getCredentialBindingDao().delete({ serverName: 'copy-target' });
+  await getServerDao().delete('copy-target');
+  await getServerDao().delete('copy-private');
 });

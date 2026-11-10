@@ -1,4 +1,4 @@
-import { oauthServerMetadataSchema } from './oauthServerMetadata.js';
+import { oauthServerMetadataSchema, validateAuthorizationRelay } from './oauthServerMetadata.js';
 import { resolveUpstreamProtocolMode } from './mcpProtocol.js';
 import { validateCredentialTemplate } from './credentialTemplate.js';
 import { validateMaxBufferSize } from './stdioOptions.js';
@@ -191,6 +191,17 @@ export const normalizeOAuth = (
     normalized.authorizationServerMetadata = result.data;
   }
 
+  if (oauth.authorizationRelay !== undefined) {
+    try {
+      validateAuthorizationRelay(oauth);
+    } catch {
+      throw new ServerConfigValidationError(
+        'Invalid oauth.authorizationRelay: requires personal OAuth, explicit server metadata and HTTPS redirect origins',
+      );
+    }
+    normalized.authorizationRelay = structuredClone(oauth.authorizationRelay);
+  }
+
   const clientId = trimToUndefined(oauth.clientId);
   const clientSecret = trimToUndefined(oauth.clientSecret);
   const accessToken = trimToUndefined(oauth.accessToken);
@@ -206,6 +217,12 @@ export const normalizeOAuth = (
   if (clientSecret) normalized.clientSecret = clientSecret;
   if (scopes !== undefined) normalized.scopes = scopes;
   if (accessToken) normalized.accessToken = accessToken;
+  if (
+    accessToken &&
+    typeof oauth.accessTokenExpiresAt === 'number' &&
+    Number.isFinite(oauth.accessTokenExpiresAt)
+  )
+    normalized.accessTokenExpiresAt = oauth.accessTokenExpiresAt;
   if (refreshToken) normalized.refreshToken = refreshToken;
   if (authorizationEndpoint) normalized.authorizationEndpoint = authorizationEndpoint;
   if (tokenEndpoint) normalized.tokenEndpoint = tokenEndpoint;
@@ -333,6 +350,17 @@ export const normalizeServerConfigForPersistence = (config: ServerConfig): Serve
   // Default visibility to 'private' so file-defined and freshly-created servers behave
   // identically to the pre-#817 implicit admin-only behaviour. Operators opt servers in
   // to 'public' or restricted 'group' sharing from the dashboard.
+  if (
+    config.sharedWithUserGroups != null &&
+    (!Array.isArray(config.sharedWithUserGroups) ||
+      !config.sharedWithUserGroups.every(
+        (name: unknown) => typeof name === 'string' && name.trim().length > 0,
+      ))
+  ) {
+    throw new ServerConfigValidationError(
+      'sharedWithUserGroups must be an array of non-empty strings',
+    );
+  }
   const visibility = config.visibility ?? 'private';
   const sharedWithUsers =
     visibility === 'group' ? normalizeSharedUsers(config.sharedWithUsers) : undefined;
@@ -346,6 +374,8 @@ export const normalizeServerConfigForPersistence = (config: ServerConfig): Serve
     owner,
     visibility,
     sharedWithUsers,
+    sharedWithUserGroups:
+      visibility === 'group' ? normalizeSharedUsers(config.sharedWithUserGroups) : undefined,
     options,
     perSessionClient: config.perSessionClient === true ? true : undefined,
     // The dashboard sends `startOnDemand: undefined` when the toggle is off, which

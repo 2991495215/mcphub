@@ -72,8 +72,9 @@ A server entry has the shape `"<server-name>": ServerConfig`. The relevant field
 | `type` | `"stdio" \| "sse" \| "streamable-http" \| "openapi"` | Recommended | Transport. Defaults to `stdio` when omitted but a `command` is provided. |
 | `enabled` | boolean | no | Defaults to `true`. Disabled servers stay in settings but are not connected. |
 | `owner` | string | no | Username that owns the entry. Defaults to the creating user or `admin`. Used for user-scoped routes (`/:user/mcp/...`). |
-| `visibility` | `"private" \| "group" \| "public"` | no | Runtime access for non-admin users. Defaults to `private`; `group` grants access to `sharedWithUsers`. |
+| `visibility` | `"private" \| "group" \| "public"` | no | Runtime access for non-admin users. Defaults to `private`; `group` grants access to selected users and user-group members. |
 | `sharedWithUsers` | string[] | no | Local usernames allowed to discover and call a server whose `visibility` is `group`. Ignored for other visibility values. |
+| `sharedWithUserGroups` | string[] | no | Case-sensitive user-group names whose members can use this server when `visibility` is `group`. Administrators set `userGroups` on users through the user edit form or `PUT /api/users/:username`. Existing user-key and OAuth requests read current memberships. |
 | `description` | string | no | Free-form description displayed in the dashboard. |
 | `options` | object | no | Per-server runtime options (see `src/types/index.ts`). |
 | `proxy` | object | no | Optional HTTP proxy settings (`url`, `noProxy`, etc.). |
@@ -664,6 +665,7 @@ You can also configure runtime routing and authentication behavior under `system
     "routing": {
       "enableBearerAuth": true,
       "bearerAuthHeaderName": "X-MCP-Authorization",
+      "allowAuthorizationPassthrough": true,
       "jsonBodyLimit": "5mb",
       "skipAuth": false
     }
@@ -672,8 +674,23 @@ You can also configure runtime routing and authentication behavior under `system
 ```
 
 - `bearerAuthHeaderName` defaults to `Authorization` and controls which incoming header MCPHub reads for Bearer authentication.
-- Use a custom header such as `X-MCP-Authorization` when an upstream MCP/OpenAPI server also needs to passthrough `Authorization`.
+- `allowAuthorizationPassthrough` defaults to `false`. To forward a caller's upstream `Authorization`, an administrator must explicitly enable it, use a separate MCPHub authentication header such as `X-MCP-Authorization`, and list `Authorization` in the trusted server's `passthroughHeaders` (HTTP MCP) or `openapi.passthroughHeaders` (OpenAPI).
+- The MCPHub authentication header is always blocked. `Authorization` remains blocked in hosted mode, and `Cookie`, `Proxy-Authorization`, `X-Auth-Token`, and `X-Api-Key` remain blocked regardless of the opt-in. Listing a blocked header does not forward it.
+- This instance-wide opt-in trusts every configured passthrough destination with the caller's upstream token. Only enable it for trusted destinations; passthrough configuration remains admin-only. Existing installations keep filtering `Authorization` until explicitly opted in.
 - `jsonBodyLimit` defaults to `1mb` and controls the Express JSON parser limit for API requests, including large inline OpenAPI schema uploads.
+
+Administrators can enable this in **Settings → Keys → Allow Authorization passthrough** after saving a separate MCPHub authentication header. The switch is hidden in hosted mode. In database mode, you can also use the admin-only `PUT /api/system-config` endpoint (authenticate with the currently configured MCPHub header):
+
+```json
+{
+  "routing": {
+    "bearerAuthHeaderName": "X-MCP-Authorization",
+    "allowAuthorizationPassthrough": true
+  }
+}
+```
+
+After configuring the server's passthrough list, send `X-MCP-Authorization: Bearer <mcphub-key>` and `Authorization: Bearer <upstream-user-token>` with each MCP request. Static upstream headers and personal credentials remain separate authentication options; they do not replace per-request caller tokens.
 
 ## Tool Result Compression
 
@@ -883,6 +900,30 @@ Each entry must be an IPv4 or IPv6 address with a prefix length (for example `/3
 Only admins can update the list through `PUT /api/system-config` with `{"network":{"allowedCidrs":["192.168.1.0/24"]}}`. Sending an empty array clears it. Invalid lists return HTTP 400 without saving. Database installations should use the dashboard or API; the field is stored in the system configuration table.
 
 Use the smallest necessary ranges. Broad ranges such as `0.0.0.0/0` or `::/0` also allow sensitive internal destinations, including loopback and cloud metadata endpoints.
+
+### Fake-IP DNS with TUN routing
+
+In **Settings → Security → Fake-IP DNS exceptions**, administrators can select a server, enter its exact hostname, add or delete rules, and save. The server selector stores its stable ID. Removing all rows and saving clears the exceptions.
+
+For SSE and Streamable HTTP upstreams behind a trusted local Fake-IP/TUN setup, administrators can grant an exact hostname on one stable server ID access to `198.18.0.0/15`, without globally allowing that range:
+
+```json
+{
+  "systemConfig": {
+    "network": {
+      "fakeIpExceptions": [
+        { "serverId": "existing-server-uuid", "hostname": "mcp.example.com" }
+      ]
+    }
+  }
+}
+```
+
+Use the existing server's `id` from `GET /api/servers` (not its display name). Hostnames must be lowercase ASCII DNS names, with no scheme, port, wildcard or trailing dot; use punycode for internationalized names. A missing ID never matches. In database mode, use the admin-only `PUT /api/system-config` with `{"network":{"fakeIpExceptions":[{"serverId":"existing-server-uuid","hostname":"mcp.example.com"}]}}`. An empty array clears exceptions. Updating either network list preserves the other, including when changing CIDRs through Settings.
+
+The exception applies to requests made through the named server's MCP transport fetch, including SDK OAuth requests that reuse that fetch. Initial DNS answers, every redirect destination and socket-time DNS answers follow the same policy. Every answer must pass; loopback, private and metadata addresses receive no additional permission. IP-literal URLs and unrelated hostnames or server IDs do not match. Redirects to another hostname require their own matching exception if they resolve to Fake-IP addresses; public destinations remain subject to normal policy. Existing global CIDR allowances and administrator-owner bypasses still apply, so use a non-admin-owned server and no broad CIDR allowances when this narrower boundary is required. Removing an exception affects later requests and lookups, but does not terminate existing streams or connections.
+
+Guarded connections use direct socket DNS validation and bypass configured HTTP/HTTPS proxies. A system-level TUN must intercept and route these connections, and its DNS mapping must agree with the DNS visible inside the MCPHub process/container. Merely allowing the synthetic range does not establish routing. MCPHub trusts the local DNS/TUN mapping and cannot determine the real destination behind a synthetic address; only grant exceptions for trusted endpoints and a trusted proxy environment. TLS still uses the original hostname. This policy does not enable explicit HTTP proxy routing or add exceptions to OpenAPI requests, separate OAuth discovery/token/registration fetches, or anonymous CIMD URLs; these keep their existing SSRF policy. OAuth setups using those separate fetches may therefore still need real DNS results for their endpoints.
 
 ## On-demand tool snapshots
 
